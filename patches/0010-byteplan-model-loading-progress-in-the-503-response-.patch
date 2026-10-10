@@ -1,0 +1,367 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sat, 10 Oct 2026 09:24:33 +0200
+Subject: [PATCH 10/27] byteplan: model loading progress in the 503 response
+ and the web UI
+
+- server: the loading stages (text model, expert pool, MTP draft, vision) and their progress,
+  reported by the existing load callbacks, are kept in the HTTP context and returned with
+  the 503 "Loading model" error as error.progress {stage, stages, value, overall}
+- web UI: ApiError carries the parsed error body, serverStore.loadProgress, the loading
+  banner shows the overall percent, a progress bar and the current stage; polls every 500 ms
+---
+ tools/server/server-context.cpp               |  7 ++++
+ tools/server/server-http.cpp                  | 41 ++++++++++++++-----
+ tools/server/server-http.h                    |  7 ++++
+ tools/server/server.cpp                       | 20 ++++++---
+ .../ChatScreen/ChatScreenServerError.svelte   | 35 +++++++++++++++-
+ tools/ui/src/lib/stores/server.svelte.ts      | 24 ++++++++++-
+ tools/ui/src/lib/utils/api-fetch.ts           | 25 ++++++-----
+ 7 files changed, 132 insertions(+), 27 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 23835e1..afd54ae 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1108,6 +1108,7 @@ private:
+         load_progress_data load_progress_text  (this, "text_model");
+         load_progress_data load_progress_mmproj(this, "mmproj_model");
+         load_progress_data load_progress_spec  (this, "spec_model");
++        load_progress_data load_progress_spar  (this, "experts"); // byteplan expert pool preload
+ 
+         const bool is_resume = sleeping;
+ 
+@@ -1125,6 +1126,9 @@ private:
+ 
+         if (callback_state) {
+             std::vector<std::string> stages = {"text_model"};
++            if (!params.spar_experts.empty()) {
++                stages.push_back("experts");
++            }
+             if (has_spec) {
+                 stages.push_back("spec_model");
+             }
+@@ -1134,6 +1138,7 @@ private:
+             load_progress_text.stages   = stages;
+             load_progress_mmproj.stages = stages;
+             load_progress_spec.stages   = stages;
++            load_progress_spar.stages   = stages;
+ 
+             // trigger 0% progress
+             load_progress_callback(0.0f, &load_progress_text);
+@@ -1203,6 +1208,8 @@ private:
+         {
+             params_base.load_progress_callback = load_progress_callback;
+             params_base.load_progress_callback_user_data = &load_progress_text;
++            params_base.spar_progress_callback = load_progress_callback;
++            params_base.spar_progress_callback_user_data = &load_progress_spar;
+         }
+ 
+         llama_init = common_init_from_params(params_base);
+diff --git a/tools/server/server-http.cpp b/tools/server/server-http.cpp
+index 33cbb15..e9648cb 100644
+--- a/tools/server/server-http.cpp
++++ b/tools/server/server-http.cpp
+@@ -312,16 +312,37 @@ bool server_http_context::init_listener(const common_params & params) {
+             // no endpoints are allowed to be accessed when the server is not ready
+             // this is to prevent any data races or inconsistent states
+             res.status = 503;
+-            res.set_content(
+-                safe_json_to_str(json {
+-                    {"error", {
+-                        {"message", "Loading model"},
+-                        {"type", "unavailable_error"},
+-                        {"code", 503}
+-                    }}
+-                }),
+-                "application/json; charset=utf-8"
+-            );
++            json err = {
++                {"message", "Loading model"},
++                {"type", "unavailable_error"},
++                {"code", 503}
++            };
++            {
++                // byteplan: progress for the UI; overall weights the stages by their typical share of the load time
++                std::lock_guard<std::mutex> lock(load_mu);
++                if (!load_stage.empty()) {
++                    const auto weight = [](const std::string & s) {
++                        return s == "text_model" ? 0.55 : s == "experts" ? 0.30 : s == "spec_model" ? 0.10 : 0.05;
++                    };
++                    double total = 0.0, before = 0.0;
++                    bool   seen  = false;
++                    for (const auto & s : load_stages) {
++                        total += weight(s);
++                        seen = seen || s == load_stage;
++                        if (!seen) {
++                            before += weight(s);
++                        }
++                    }
++                    const double overall = total > 0.0 ? (before + weight(load_stage) * load_value) / total : 0.0;
++                    err["progress"] = {
++                        {"stage",   load_stage},
++                        {"stages",  load_stages},
++                        {"value",   load_value},
++                        {"overall", std::min(1.0, overall)},
++                    };
++                }
++            }
++            res.set_content(safe_json_to_str(json {{"error", err}}), "application/json; charset=utf-8");
+             return false;
+         }
+         return true;
+diff --git a/tools/server/server-http.h b/tools/server/server-http.h
+index 4554b20..7c30d4b 100644
+--- a/tools/server/server-http.h
++++ b/tools/server/server-http.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <mutex>
+ #include <functional>
+ #include <map>
+ #include <memory>
+@@ -70,6 +71,12 @@ struct server_http_context {
+ 
+     std::atomic<bool> is_ready = false;
+ 
++    // byteplan: loading progress for the 503 "Loading model" response (stages in order, current stage, 0..1 of it)
++    std::mutex               load_mu;
++    std::vector<std::string> load_stages;
++    std::string              load_stage;
++    float                    load_value = 0.0f;
++
+     // note: the handler should never throw exceptions
+     using handler_t = std::function<server_http_res_ptr(const server_http_req & req)>;
+     mutable std::unordered_map<std::string, handler_t> handlers;
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 6e2d8ff..0fa67c2 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -478,12 +478,22 @@ int llama_server(common_params & params, int argc, char ** argv, server_child &
+             return 1;
+         }
+ 
+-        // setup communication child --> router if necessary
+-        if (child.is_child()) {
+-            ctx_server.set_state_callback([&](server_state state, json payload) {
++        // loading progress for the 503 response (byteplan), and child --> router communication if necessary
++        ctx_server.set_state_callback([&](server_state state, json payload) {
++            if (state == SERVER_STATE_LOADING) {
++                std::lock_guard<std::mutex> lock(ctx_http.load_mu);
++                if (payload.contains("stages")) {
++                    ctx_http.load_stages = payload.at("stages").get<std::vector<std::string>>();
++                }
++                if (payload.contains("current") || payload.contains("stage")) {
++                    ctx_http.load_stage = payload.value("current", payload.value("stage", std::string()));
++                    ctx_http.load_value = payload.value("value", 0.0f);
++                }
++            }
++            if (child.is_child()) {
+                 child.notify_to_router(server_state_to_str(state), payload);
+-            });
+-        }
++            }
++        });
+ 
+         if (!ctx_server.load_model(params)) {
+             clean_up();
+diff --git a/tools/ui/src/lib/components/app/chat/ChatScreen/ChatScreenServerError.svelte b/tools/ui/src/lib/components/app/chat/ChatScreen/ChatScreenServerError.svelte
+index cf9f55f..4225e4e 100644
+--- a/tools/ui/src/lib/components/app/chat/ChatScreen/ChatScreenServerError.svelte
++++ b/tools/ui/src/lib/components/app/chat/ChatScreen/ChatScreenServerError.svelte
+@@ -4,8 +4,24 @@
+ 	import { ICON_CLASS_DEFAULT } from '$lib/constants';
+ 	import { serverStore } from '$lib/stores';
+ 
++	const STAGE_LABELS: Record<string, string> = {
++		text_model: 'Model weights',
++		experts: 'Expert pool',
++		spec_model: 'Draft model (MTP)',
++		mmproj_model: 'Vision model'
++	};
++
+ 	let hasError = $derived(!!serverStore.error);
+ 	let isLoadingModel = $derived(serverStore.status === 503);
++	let progress = $derived(serverStore.loadProgress);
++	let percent = $derived(progress ? Math.round(progress.overall * 100) : null);
++	let stageText = $derived.by(() => {
++		if (!progress) return null;
++		const step = progress.stages.indexOf(progress.stage) + 1;
++		const label = STAGE_LABELS[progress.stage] ?? progress.stage;
++
++		return `${label} ${Math.round(progress.value * 100)} % · step ${step} of ${progress.stages.length}`;
++	});
+ </script>
+ 
+ {#if hasError}
+@@ -18,7 +34,10 @@
+ 			{/if}
+ 
+ 			<Alert.Title class="flex items-center justify-between">
+-				<span>{isLoadingModel ? 'Loading model' : 'Server unavailable'}</span>
++				<span>
++					{isLoadingModel ? 'Loading model' : 'Server unavailable'}{#if isLoadingModel && percent !== null}
++						<span class="tabular-nums">&nbsp;{percent} %</span>{/if}
++				</span>
+ 
+ 				{#if !isLoadingModel}
+ 					<button
+@@ -34,6 +53,20 @@
+ 
+ 			{#if !isLoadingModel}
+ 				<Alert.Description>{serverStore.error}</Alert.Description>
++			{:else if percent !== null}
++				<Alert.Description class="w-full">
++					<div
++						class="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-muted"
++						role="progressbar"
++						aria-label="Model loading progress"
++						aria-valuemin={0}
++						aria-valuemax={100}
++						aria-valuenow={percent}
++					>
++						<div class="h-full rounded-full bg-primary transition-[width] duration-500" style="width: {percent}%"></div>
++					</div>
++					<span class="mt-1 block text-xs text-muted-foreground">{stageText}</span>
++				</Alert.Description>
+ 			{/if}
+ 		</Alert.Root>
+ 	</div>
+diff --git a/tools/ui/src/lib/stores/server.svelte.ts b/tools/ui/src/lib/stores/server.svelte.ts
+index e145e28..0eaed59 100644
+--- a/tools/ui/src/lib/stores/server.svelte.ts
++++ b/tools/ui/src/lib/stores/server.svelte.ts
+@@ -10,7 +10,25 @@ import { ServerRole } from '$lib/enums';
+ import { PropsService } from '$lib/services/props.service';
+ import { ApiError } from '$lib/utils';
+ 
+-const LOADING_RETRY_INTERVAL_MS = 1000;
++const LOADING_RETRY_INTERVAL_MS = 500;
++
++/** Model loading progress sent by the server with its 503 "Loading model" response. */
++export interface ServerLoadProgress {
++	stage: string;
++	stages: string[];
++	/** 0..1 of the current stage */
++	value: number;
++	/** 0..1 of the whole load, stages weighted by their typical duration */
++	overall: number;
++}
++
++function loadProgressOf(error: unknown): ServerLoadProgress | null {
++	if (!(error instanceof ApiError)) return null;
++
++	const progress = (error.data as { error?: { progress?: ServerLoadProgress } } | undefined)?.error?.progress;
++
++	return typeof progress?.overall === 'number' ? progress : null;
++}
+ 
+ class ServerStore {
+ 	error = $state<string | null>(null);
+@@ -18,6 +36,7 @@ class ServerStore {
+ 	props = $state<ApiLlamaCppServerProps | null>(null);
+ 	role = $state<ServerRole | null>(null);
+ 	status = $state<number | null>(null);
++	loadProgress = $state<ServerLoadProgress | null>(null);
+ 	private fetchPromise: Promise<void> | null = null;
+ 	private retryTimer: ReturnType<typeof setTimeout> | null = null;
+ 
+@@ -48,6 +67,7 @@ class ServerStore {
+ 		this.props = null;
+ 		this.error = null;
+ 		this.status = null;
++		this.loadProgress = null;
+ 		this.loading = false;
+ 		this.role = null;
+ 		this.fetchPromise = null;
+@@ -80,10 +100,12 @@ class ServerStore {
+ 				this.props = props;
+ 				this.error = null;
+ 				this.status = null;
++				this.loadProgress = null;
+ 				this.detectRole(props);
+ 			} catch (error: unknown) {
+ 				this.error = error instanceof Error ? error.message : String(error);
+ 				this.status = error instanceof ApiError ? error.status : null;
++				this.loadProgress = this.status === 503 ? loadProgressOf(error) : null;
+ 				console.error('Error fetching server properties:', error);
+ 
+ 				if (this.status === 503) {
+diff --git a/tools/ui/src/lib/utils/api-fetch.ts b/tools/ui/src/lib/utils/api-fetch.ts
+index fefea2f..4751179 100644
+--- a/tools/ui/src/lib/utils/api-fetch.ts
++++ b/tools/ui/src/lib/utils/api-fetch.ts
+@@ -18,11 +18,14 @@ import { API_ABSOLUTE_URL_PROTOCOLS, ERROR_MESSAGES, HTTP_CODE_TO_STRING } from
+  */
+ export class ApiError extends Error {
+ 	status: number;
++	/** Parsed JSON error body, when the server sent one (e.g. the loading progress of a 503). */
++	data?: unknown;
+ 
+-	constructor(message: string, status: number) {
++	constructor(message: string, status: number, data?: unknown) {
+ 		super(message);
+ 		this.name = 'ApiError';
+ 		this.status = status;
++		this.data = data;
+ 	}
+ }
+ 
+@@ -77,9 +80,9 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}):
+ 	}
+ 
+ 	if (!response.ok) {
+-		const errorMessage = await parseErrorMessage(response);
++		const { message, data } = await parseError(response);
+ 
+-		throw new ApiError(errorMessage, response.status);
++		throw new ApiError(message, response.status, data);
+ 	}
+ 
+ 	return response.json() as Promise<T>;
+@@ -175,20 +178,22 @@ export async function apiDelete<T>(
+  * Parse error message from a failed response.
+  * Tries to extract error message from JSON body, falls back to status text.
+  */
+-async function parseErrorMessage(response: Response): Promise<string> {
++async function parseError(response: Response): Promise<{ message: string; data?: unknown }> {
++	let errorData;
++
+ 	try {
+-		const errorData = await response.json();
++		errorData = await response.json();
+ 
+ 		if (errorData?.error?.message) {
+-			return errorData.error.message;
++			return { message: errorData.error.message, data: errorData };
+ 		}
+ 
+ 		if (errorData?.error && typeof errorData.error === 'string') {
+-			return errorData.error;
++			return { message: errorData.error, data: errorData };
+ 		}
+ 
+ 		if (errorData?.message) {
+-			return errorData.message;
++			return { message: errorData.message, data: errorData };
+ 		}
+ 	} catch {
+ 		// JSON parsing failed, use status text
+@@ -197,10 +202,10 @@ async function parseErrorMessage(response: Response): Promise<string> {
+ 	const httpErrorStr = HTTP_CODE_TO_STRING[response.status];
+ 
+ 	if (httpErrorStr) {
+-		return httpErrorStr;
++		return { message: httpErrorStr, data: errorData };
+ 	}
+ 
+-	return `${ERROR_MESSAGES.HTTP.GENERIC}: ${response.status} ${response.statusText}`;
++	return { message: `${ERROR_MESSAGES.HTTP.GENERIC}: ${response.status} ${response.statusText}`, data: errorData };
+ }
+ 
+ /**
+-- 
+2.53.0
+

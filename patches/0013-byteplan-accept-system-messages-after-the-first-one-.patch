@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sat, 10 Oct 2026 15:18:30 +0200
+Subject: [PATCH 13/27] byteplan: accept system messages after the first one
+ (Claude Code, Codex)
+
+Templates like Qwen's raise 'System message must be at the beginning'. Claude Code sends a
+system message after the user turn and Codex sends developer messages, so both failed.
+A new template capability (supports_late_system_role) is probed at load; when it is false,
+a leading run of system messages is merged and later ones are passed as user messages at
+their place, which keeps the cached prefix. Requests without such messages are unchanged.
+---
+ common/chat.cpp       | 40 ++++++++++++++++++++++++++++++++++++++++
+ common/jinja/caps.cpp | 20 ++++++++++++++++++++
+ common/jinja/caps.h   |  3 +++
+ 3 files changed, 63 insertions(+)
+
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 2c795c2..587f5a9 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1029,6 +1029,42 @@ static void system_message_not_supported(json & messages) {
+     }
+ }
+ 
++// if the template only accepts a system message at the start: merge a leading run of system messages into one
++// and pass later ones as user messages, at their place, so the cached prefix of the conversation stays the same
++static void system_message_only_first(json & messages) {
++    const auto is_system = [](const json & m) { return m.value("role", "") == "system"; };
++    if (messages.size() < 2 || std::none_of(std::next(messages.begin()), messages.end(), is_system)) {
++        return;
++    }
++    // text content as a list of parts, so string and part-list contents can be joined
++    const auto as_parts = [](const json & content) {
++        return content.is_string() ? json::array({ { { "type", "text" }, { "text", content.get<std::string>() } } }) : content;
++    };
++    json out = json::array();
++    for (auto & msg : messages) {
++        const bool sys = is_system(msg);
++        if (sys && out.size() == 1 && is_system(out[0]) && out[0].contains("content") && msg.contains("content")) {
++            json & first = out[0]["content"];
++            if (first.is_string() && msg["content"].is_string()) {
++                first = first.get<std::string>() + "\n\n" + msg["content"].get<std::string>();
++            } else {
++                json parts = as_parts(first);
++                parts.push_back({ { "type", "text" }, { "text", "\n\n" } });
++                for (auto & part : as_parts(msg["content"])) {
++                    parts.push_back(std::move(part));
++                }
++                first = std::move(parts);
++            }
++            continue;
++        }
++        if (sys && !out.empty()) {
++            msg["role"] = "user";
++        }
++        out.push_back(std::move(msg));
++    }
++    messages = std::move(out);
++}
++
+ static void requires_non_null_content(json & messages) {
+     GGML_ASSERT(messages.is_array());
+     for (auto & message : messages) {
+@@ -1289,6 +1325,10 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
+         workaround::map_developer_role_to_system(params.messages);
+     }
+ 
++    if (!tmpl.original_caps().supports_late_system_role) {
++        workaround::system_message_only_first(params.messages);
++    }
++
+     if (!tmpl.original_caps().supports_system_role) {
+         workaround::system_message_not_supported(params.messages);
+     }
+diff --git a/common/jinja/caps.cpp b/common/jinja/caps.cpp
+index 6ff17d1..2e7b4ae 100644
+--- a/common/jinja/caps.cpp
++++ b/common/jinja/caps.cpp
+@@ -114,6 +114,7 @@ std::map<std::string, bool> caps::to_map() const {
+         {"supports_preserve_reasoning", supports_preserve_reasoning},
+         {"supports_reasoning_effort", supports_reasoning_effort},
+         {"supports_object_arguments", supports_object_arguments},
++        {"supports_late_system_role", supports_late_system_role},
+     };
+ }
+ 
+@@ -231,6 +232,25 @@ caps caps_get(jinja::program & prog) {
+         }
+     );
+ 
++    JJ_DEBUG("%s\n", ">>> Running capability check: system message after the first message");
++
++    // case: a later system message; templates such as Qwen's raise an exception for it
++    caps_try_execute(
++        prog,
++        [&]() {
++            return json::array({
++                {{"role", "system"}, {"content", "System message"}},
++                {{"role", "user"},   {"content", "User message"}},
++                {{"role", "system"}, {"content", "Late system message"}},
++            });
++        },
++        nullptr, // ctx_fn
++        nullptr, // tools_fn
++        [&](context &, bool success, value &, value &, const std::string &) {
++            result.supports_late_system_role = success;
++        }
++    );
++
+     JJ_DEBUG("%s\n", ">>> Running capability check: single tool with object arguments support");
+ 
+     // case: tools support: single call with object arguments
+diff --git a/common/jinja/caps.h b/common/jinja/caps.h
+index b81dd95..98b7e21 100644
+--- a/common/jinja/caps.h
++++ b/common/jinja/caps.h
+@@ -25,6 +25,9 @@ struct caps {
+ 
+     bool supports_object_arguments = false;
+ 
++    // a system message after the first message renders (agents such as Claude Code and Codex send them)
++    bool supports_late_system_role = true;
++
+     // for reporting on server
+     std::map<std::string, bool> to_map() const;
+ 
+-- 
+2.53.0
+

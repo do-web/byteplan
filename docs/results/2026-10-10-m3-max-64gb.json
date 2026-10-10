@@ -1,0 +1,192 @@
+{
+ "llama.cpp (stock)": [
+  {
+   "decode": {
+    "code-edit": 77.73843584559918,
+    "agent-refactor": 69.77550294632688,
+    "code-new": 75.54873254605783,
+    "prose": 51.6559104517209
+   },
+   "hash": {
+    "code-edit": "110ea42a",
+    "agent-refactor": "600f0858",
+    "code-new": "3fd05bb5",
+    "prose": "15f62653"
+   },
+   "prefill": 449.69695432693743,
+   "prefill_tokens": 6951,
+   "ttft_s": 3.690667,
+   "ttft_tokens": 1673
+  },
+  {
+   "decode": {
+    "code-edit": 74.82679968025069,
+    "agent-refactor": 67.39170344412084,
+    "code-new": 72.34584500671231,
+    "prose": 50.0890133639595
+   },
+   "hash": {
+    "code-edit": "110ea42a",
+    "agent-refactor": "600f0858",
+    "code-new": "3fd05bb5",
+    "prose": "15f62653"
+   },
+   "prefill": 430.8281563399825,
+   "prefill_tokens": 6951,
+   "ttft_s": 3.8754969999999997,
+   "ttft_tokens": 1673
+  }
+ ],
+ "llama.cpp, no drafts": [
+  {
+   "decode": {
+    "code-edit": 36.31445963013622,
+    "agent-refactor": 36.24311380837641,
+    "code-new": 36.30299505362607,
+    "prose": 36.30686333976877
+   },
+   "hash": {
+    "code-edit": "110ea42a",
+    "agent-refactor": "600f0858",
+    "code-new": "3fd05bb5",
+    "prose": "65946d7f"
+   },
+   "prefill": 466.24687231925657,
+   "prefill_tokens": 6951,
+   "ttft_s": 3.561944,
+   "ttft_tokens": 1673
+  },
+  {
+   "decode": {
+    "code-edit": 35.67340556741627,
+    "agent-refactor": 35.64529199441633,
+    "code-new": 36.47774024010468,
+    "prose": 36.388055873354396
+   },
+   "hash": {
+    "code-edit": "110ea42a",
+    "agent-refactor": "600f0858",
+    "code-new": "3fd05bb5",
+    "prose": "65946d7f"
+   },
+   "prefill": 460.3881712760567,
+   "prefill_tokens": 6951,
+   "ttft_s": 3.609,
+   "ttft_tokens": 1673
+  }
+ ],
+ "Byteplan": [
+  {
+   "decode": {
+    "code-edit": 162.01838503173596,
+    "agent-refactor": 108.61055805771944,
+    "code-new": 79.79425685496129,
+    "prose": 56.99638985973355
+   },
+   "hash": {
+    "code-edit": "110ea42a",
+    "agent-refactor": "043884bf",
+    "code-new": "3fd05bb5",
+    "prose": "15f62653"
+   },
+   "prefill": 450.17461995670527,
+   "prefill_tokens": 6951,
+   "ttft_s": 0.21656899999999998,
+   "ttft_tokens": 22
+  },
+  {
+   "decode": {
+    "code-edit": 161.31993079931246,
+    "agent-refactor": 108.1170921336818,
+    "code-new": 80.13339045177226,
+    "prose": 56.85354802018099
+   },
+   "hash": {
+    "code-edit": "110ea42a",
+    "agent-refactor": "043884bf",
+    "code-new": "3fd05bb5",
+    "prose": "15f62653"
+   },
+   "prefill": 457.34544753762145,
+   "prefill_tokens": 6951,
+   "ttft_s": 0.21291900000000002,
+   "ttft_tokens": 22
+  }
+ ],
+ "Byteplan --spar 410": [
+  {
+   "decode": {
+    "code-edit": 121.74100744949338,
+    "agent-refactor": 91.1687129259488,
+    "code-new": 66.35659413671952,
+    "prose": 49.650486285539465
+   },
+   "hash": {
+    "code-edit": "110ea42a",
+    "agent-refactor": "043884bf",
+    "code-new": "3fd05bb5",
+    "prose": "15f62653"
+   },
+   "prefill": 376.465934301143,
+   "prefill_tokens": 6951,
+   "ttft_s": 0.262854,
+   "ttft_tokens": 22
+  },
+  {
+   "decode": {
+    "code-edit": 120.34064836703496,
+    "agent-refactor": 92.5965504437476,
+    "code-new": 68.54989521168687,
+    "prose": 50.42206861350245
+   },
+   "hash": {
+    "code-edit": "110ea42a",
+    "agent-refactor": "043884bf",
+    "code-new": "3fd05bb5",
+    "prose": "15f62653"
+   },
+   "prefill": 393.6394301328803,
+   "prefill_tokens": 6951,
+   "ttft_s": 0.264591,
+   "ttft_tokens": 22
+  }
+ ],
+ "Byteplan --spar 358": [
+  {
+   "decode": {
+    "code-edit": 96.03532219743774,
+    "agent-refactor": 78.11281523712539,
+    "code-new": 57.178743550854676,
+    "prose": 39.77409344672254
+   },
+   "hash": {
+    "code-edit": "110ea42a",
+    "agent-refactor": "043884bf",
+    "code-new": "3fd05bb5",
+    "prose": "15f62653"
+   },
+   "prefill": 358.91435919225836,
+   "prefill_tokens": 6951,
+   "ttft_s": 0.30835500000000005,
+   "ttft_tokens": 22
+  },
+  {
+   "decode": {
+    "code-edit": 96.60578424715348,
+    "agent-refactor": 78.52373285929106,
+    "code-new": 58.435426870793286,
+    "prose": 45.3595359763508
+   },
+   "hash": {
+    "code-edit": "110ea42a",
+    "agent-refactor": "043884bf",
+    "code-new": "3fd05bb5",
+    "prose": "15f62653"
+   },
+   "prefill": 359.78866104114076,
+   "prefill_tokens": 6951,
+   "ttft_s": 0.310191,
+   "ttft_tokens": 22
+  }
+ ]
+}

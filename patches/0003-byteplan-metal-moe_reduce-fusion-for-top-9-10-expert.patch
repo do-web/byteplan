@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Thu, 8 Oct 2026 23:36:24 +0200
+Subject: [PATCH 03/27] byteplan: metal moe_reduce fusion for top-9/10 experts
+ (qwen4exp)
+
+---
+ ggml/src/ggml-metal/ggml-metal-fusion.cpp | 16 +++++++++++++++-
+ ggml/src/ggml-metal/ggml-metal-fusion.h   |  2 +-
+ tests/test-backend-ops.cpp                |  5 +++++
+ 3 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.cpp b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+index d78ca7c..cd51a38 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+@@ -500,7 +500,7 @@ static bool ggml_metal_fusion_check_topk_moe(
+     return true;
+ }
+ 
+-#define GGML_METAL_MOE_REDUCE_MAX_EXPERTS 8
++#define GGML_METAL_MOE_REDUCE_MAX_EXPERTS 10 // byteplan: qwen4exp uses top-10
+ 
+ struct ggml_metal_moe_reduce_match {
+     const ggml_tensor * experts;
+@@ -755,6 +755,18 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
+     GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
+ };
+ 
++// byteplan: top-9/10 (qwen4exp)
++static const std::vector<ggml_op> ops_moe_reduce_9 = {
++    GGML_OP_MUL,
++    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
++    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
++};
++static const std::vector<ggml_op> ops_moe_reduce_10 = {
++    GGML_OP_MUL,
++    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
++    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
++};
++
+ static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+ 
+ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+@@ -783,6 +795,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_6,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_7,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_9,           {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_10,          {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
+     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+ };
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.h b/ggml/src/ggml-metal/ggml-metal-fusion.h
+index 5d994c2..9e59645 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.h
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.h
+@@ -20,7 +20,7 @@ struct ggml_metal_device_props;
+ 
+ // the maximum number of nodes that can be fused in a single kernel
+ // (also the maximum length of a packed fusion group during graph optimization)
+-#define GGML_METAL_FUSION_MAX 16
++#define GGML_METAL_FUSION_MAX 24 // byteplan: moe_reduce with 10 experts spans 20 raw nodes
+ 
+ typedef enum ggml_metal_fusion_mode {
+     // structural checks for the graph optimizer, which runs before the graph tensors are allocated (weights
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 89554d4..f4e2032 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11542,6 +11542,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
+     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
+     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
++    // byteplan: qwen4exp top-10 (n_embd 2560), single-token decode and batch
++    test_cases.emplace_back(new test_moe_reduce(2560, 10, 1));
++    test_cases.emplace_back(new test_moe_reduce(2560, 10, 1, false, true));
++    test_cases.emplace_back(new test_moe_reduce(2560, 10, 64));
++    test_cases.emplace_back(new test_moe_reduce(63,    9, 17, true, false, true));
+ 
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
+-- 
+2.53.0
+

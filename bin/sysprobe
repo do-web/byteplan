@@ -1,0 +1,20 @@
+#!/bin/bash
+# One line of memory/thermal state for bin/run-guarded and the bench (bash 3.2, three forks):
+#   swap_used_mb=<int> pressure_level=<int> swapouts=<int> thermal=<int>
+# pressure_level: kern.memorystatus_vm_pressure_level (1 normal, 2 warn, 4 critical)
+# swapouts: pages swapped out since boot (vm_stat)
+# thermal: thermal pressure level (0 nominal, 1 moderate, 2 heavy, 3 trapping); the Apple Silicon
+#   signal, pmset's CPU_Speed_Limit is Intel-only
+# An unreadable value is -1.
+
+swap=-1 swapouts=-1
+s=$(sysctl -n vm.swapusage kern.memorystatus_vm_pressure_level 2>/dev/null)
+# "total = 0,00M  used = 1536,25M  free = ..." (decimal comma depends on locale)
+[[ $s =~ used\ =\ ([0-9]+)[.,0-9]*M ]] && swap=${BASH_REMATCH[1]}
+level=${s##*$'\n'}
+[[ $level =~ ^[0-9]+$ ]] || level=-1
+[[ $(vm_stat 2>/dev/null) =~ Swapouts:\ +([0-9]+) ]] && swapouts=${BASH_REMATCH[1]}
+thermal=$(notifyutil -g com.apple.system.thermalpressurelevel 2>/dev/null)
+thermal=${thermal##* }
+[[ $thermal =~ ^[0-9]+$ ]] || thermal=-1
+echo "swap_used_mb=$swap pressure_level=$level swapouts=$swapouts thermal=$thermal"

@@ -1,0 +1,24 @@
+Byteplan is MIT licensed (see LICENSE). It contains no model weights. install.sh and bin/run download
+third-party software and models; their own licenses apply.
+
+llama.cpp / ggml
+  https://github.com/ggml-org/llama.cpp, MIT License, Copyright (c) 2023-2026 The ggml authors.
+  patches/ are changes to llama.cpp and are offered under the same MIT terms.
+  patches/0001 is a port of the qwen4exp hooks from Cudecnik/Qwen3.8-Flash-Next-refusal-projection
+  (repository under the Qwen Community License 1.0).
+
+Qwen3.8-Flash-Next (model, tokenizer, chat template)
+  https://huggingface.co/Qwen/Qwen3.8-Flash-Next, Qwen Community License 1.0.
+  Free to use, modify and share with the license notice. A "Model as a Service" or "AI Work Assistant"
+  business needs a separate license from Qwen for commercial use; internal use is exempt as long as
+  nothing is made available to third parties. Read the license itself; this summary is not legal advice.
+
+Model files downloaded by install.sh (pinned in models.lock)
+  ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF       quantized weights + vision projector (Apache-2.0 card,
+                                                    base model under the Qwen Community License)
+  Joakimpalm-Zen/Qwen3.8-Flash-Next-MTP-GGUF        MTP draft head (Qwen Community License 1.0)
+  Cudecnik/Qwen3.8-Flash-Next-refusal-projection    only with --uncensored (Qwen Community License 1.0)
+
+data/qwen3.8-flash-next.spar-profile
+  Expert usage statistics measured by running Qwen3.8-Flash-Next on our own prompts. Distributed with
+  the Qwen Community License 1.0 notice: Copyright (c) 2026 Qwen.

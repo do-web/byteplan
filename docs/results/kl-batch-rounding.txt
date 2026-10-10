@@ -1,0 +1,24 @@
+== ub 4 vs ub 1
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+Mean PPL(Q)/PPL(base)         :   0.998469 ±   0.001180
+Mean    KLD:   0.002000 ±   0.000137
+99.0%   KLD:   0.030164
+Same top p: 98.913 ± 0.115 %
+== ub 8 vs ub 1
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+Mean PPL(Q)/PPL(base)         :   0.999229 ±   0.001137
+Mean    KLD:   0.002043 ±   0.000145
+99.0%   KLD:   0.031425
+Same top p: 98.925 ± 0.114 %
+== ub 16 vs ub 1
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+Mean PPL(Q)/PPL(base)         :   0.999939 ±   0.001106
+Mean    KLD:   0.002093 ±   0.000150
+99.0%   KLD:   0.031967
+Same top p: 98.852 ± 0.118 %
+== ub 1024 vs ub 1
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+Mean PPL(Q)/PPL(base)         :   1.000116 ±   0.000992
+Mean    KLD:   0.001806 ±   0.000090
+99.0%   KLD:   0.029367
+Same top p: 99.035 ± 0.108 %

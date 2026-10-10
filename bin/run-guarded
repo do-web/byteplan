@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# Run a model process under the Byteplan safety guard: memory, swap and disk checks before the start, a memory
+# watchdog while it runs.
+#
+#   bin/run-guarded [--profile exclusive|parallel] -- <command...>     (default: exclusive)
+#
+# Single-instance lock, preflight, memory watchdog, caffeinate -i, log in logs/guard/.
+# Exit: child's code | 2 usage | 3 preflight failed | 4 stopped by watchdog | 5 lock busy
+#       | 128+n guard got signal n.
+#
+# Lock: flock on fd 9, inherited by the child, so it stays held while the model process lives,
+# even if the guard itself is SIGKILLed. The lock file is never removed (that would split the lock);
+# the holder truncates it and writes one JSON line: {"pid":<guard>,"profile":..,"log":..,"cmd":..}.
+#
+# The model process ignores SIGTSTP and its children inherit that, so Ctrl-Z does not pause a
+# run: callers stop it with SIGTERM to the guard.
+#
+# Probes: bin/sysprobe (swap, pressure level, swapouts, thermal). It and the guard take sysctl, vm_stat,
+# notifyutil, memory_pressure, df, pmset and pgrep from PATH, where the tests put stubs.
+# Env: BYTEPLAN_MODELS (default ~/byteplan-models, disk check), BYTEPLAN_GUARD_LOCK
+#   (/tmp/byteplan-model.lock), BYTEPLAN_GUARD_LOG_DIR (logs/guard), BYTEPLAN_GUARD_INTERVAL (2 s),
+#   BYTEPLAN_GUARD_LOG_EVERY (10 s), BYTEPLAN_GUARD_GRACE (10 s), BYTEPLAN_GUARD_FREE_WAIT (30 s).
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+MODELS="${BYTEPLAN_MODELS:-$HOME/byteplan-models}"
+# per-user 0700 dir, not world-writable /tmp: no symlink clobber by other users
+LOCK="${BYTEPLAN_GUARD_LOCK:-$HOME/.cache/byteplan/model.lock}"
+LOG_DIR="${BYTEPLAN_GUARD_LOG_DIR:-$ROOT/logs/guard}"
+INTERVAL="${BYTEPLAN_GUARD_INTERVAL:-0.5}" # a 35 GB load can swap gigabytes within seconds
+LOG_EVERY="${BYTEPLAN_GUARD_LOG_EVERY:-10}"
+GRACE="${BYTEPLAN_GUARD_GRACE:-10}"
+WD_GRACE="${BYTEPLAN_GUARD_WD_GRACE:-2}" # memory emergency: SIGKILL soon after SIGTERM
+FREE_WAIT="${BYTEPLAN_GUARD_FREE_WAIT:-30}" # s; a model that just exited frees its RAM asynchronously
+NEED_GB=0 HEADROOM_GB=4
+MAX_WIRED_MB=0 MAX_SWAP_MB=1024 MAX_SWAP_PARALLEL_MB=8192 MIN_FREE_PCT=25 MIN_DISK_GB=30 PRESSURE_CRITICAL=4
+
+usage() { echo "usage: bin/run-guarded [--profile exclusive|parallel] [--need-gb N] -- <command...>" >&2; exit 2; }
+say() { echo "run-guarded: $*" >&2; }
+log() { echo "$(date +%Y-%m-%dT%H:%M:%S%z) $*" >> "$LOG_FILE"; }
+json() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; printf '"%s"' "$s"; } # %q output has no control chars left
+
+probe() { # one bin/sysprobe call: PROBE (its line), SWAP, LEVEL; -1 = unreadable
+  PROBE=$("$ROOT/bin/sysprobe")
+  IFS=' =' read -r _ SWAP _ LEVEL _ <<< "$PROBE"
+}
+free_pct() { memory_pressure -Q | awk -F': ' '/free percentage/ { print $2 + 0 }'; }
+sample() { log "sample $PROBE free_pct=$(free_pct)"; } # values of the last probe
+
+stop_group() { # stop_group [grace]: SIGTERM the child's process group, SIGKILL after grace (GRACE) s; idempotent
+  local grace=${1:-$GRACE}
+  [ -n "$CHILD" ] || return 0
+  kill -TERM -- "-$CHILD" 2>/dev/null || kill -TERM "$CHILD" 2>/dev/null || return 0
+  local i=0
+  while kill -0 -- "-$CHILD" 2>/dev/null && [ "$i" -lt $((grace * 10)) ]; do sleep 0.1; i=$((i + 1)); done
+  kill -0 -- "-$CHILD" 2>/dev/null && { log "sigkill pgid=$CHILD"; kill -KILL -- "-$CHILD" 2>/dev/null; }
+  return 0
+}
+
+watchdog() { # runs with stdout/stderr on /dev/null
+  trap - EXIT
+  local last=$SECONDS swap0
+  probe; swap0=$SWAP
+  # pid check covers the moment before the child's setpgrp
+  while kill -0 "$CHILD" 2>/dev/null || kill -0 -- "-$CHILD" 2>/dev/null; do
+    sleep "$INTERVAL"
+    probe
+    if [ $((SWAP - swap0)) -gt "$MAX_SWAP_MB" ]; then
+      log "watchdog_kill swap_growth_mb=$((SWAP - swap0))"; stop_group "$WD_GRACE"; return
+    elif [ "$LEVEL" -ge "$PRESSURE_CRITICAL" ]; then
+      log "watchdog_kill pressure_level=$LEVEL"; stop_group "$WD_GRACE"; return
+    elif [ $((SECONDS - last)) -ge "$LOG_EVERY" ]; then
+      sample; last=$SECONDS
+    fi
+  done
+}
+
+cleanup() { # every exit path: no child may outlive the guard's lock bookkeeping
+  local rc=$?
+  [ -n "$WD" ] && kill "$WD" 2>/dev/null
+  stop_group
+  # the child held the terminal foreground: hand it back, but only if the guard had it
+  [ "$FG" = 1 ] && perl -MPOSIX -e '$SIG{TTOU} = "IGNORE"; tcsetpgrp(0, getpgrp)' 2>/dev/null
+  log "end exit=$rc"
+}
+
+on_signal() { # no stderr write on PIPE: it would re-raise PIPE inside the handler
+  log "signal $1"
+  [ "$1" = PIPE ] || say "got signal $1, stopping the model"
+  exit $((128 + $(kill -l "$1")))
+}
+
+# --- args
+PROFILE=exclusive
+while [ $# -gt 0 ]; do
+  case $1 in
+    --profile) [ $# -ge 2 ] || usage; PROFILE=$2; shift 2 ;;
+    --need-gb) [ $# -ge 2 ] && [ "$2" -ge 0 ] 2>/dev/null || usage; NEED_GB=$2; shift 2 ;;
+    --) shift; break ;;
+    *) usage ;;
+  esac
+done
+case $PROFILE in exclusive|parallel) ;; *) usage ;; esac
+[ $# -gt 0 ] || usage
+
+# --- lock
+# shellcheck disable=SC2174 # only the lock dir itself needs 0700
+mkdir -p -m 700 "$(dirname "$LOCK")"
+if [ -L "$LOCK" ]; then say "lock file $LOCK is a symlink, giving up"; exit 5; fi
+exec 9>>"$LOCK" || exit 5
+if ! perl -MFcntl=:flock -e 'open(my $f, ">&=", 9) or die "$!\n"; flock($f, LOCK_EX | LOCK_NB) or exit 1'; then
+  say "another model is already running (lock $LOCK: $(cat "$LOCK" 2>/dev/null)). Stop it first."
+  exit 5
+fi
+mkdir -p "$LOG_DIR"
+LOG_FILE="$(cd "$LOG_DIR" && pwd)/$(date +%Y%m%d-%H%M%S)-$$.log" # absolute: it goes into the lock
+printf -v CMD '%q ' "$@"
+CMD=${CMD% }
+# ">" truncates: same inode, so the lock stays one lock
+printf '{"pid":%s,"profile":"%s","log":%s,"cmd":%s}\n' $$ "$PROFILE" "$(json "$LOG_FILE")" "$(json "$CMD")" > "$LOCK"
+CHILD='' WD='' FG=''
+trap cleanup EXIT
+# shellcheck disable=SC2064 # $s must expand now
+for s in HUP INT QUIT PIPE ALRM TERM XCPU XFSZ VTALRM PROF USR1 USR2; do trap "on_signal $s" "$s"; done
+
+say "Log: $LOG_FILE"
+log "start pid=$$ profile=$PROFILE cwd=$PWD cmd=$CMD"
+
+# --- preflight
+WIRED=$(sysctl -n iogpu.wired_limit_mb)
+TOTAL_MB=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1048576 ))
+# a raised GPU wired limit up to 13/16 of the RAM (52 GiB on 64 GB) leaves macOS enough to stay responsive
+MAX_WIRED_MB=$(( TOTAL_MB > 0 ? TOTAL_MB * 13 / 16 : 53248 ))
+probe
+FREE=$(free_pct)
+# back-to-back runs: the previous model's memory is still being released, wait for it before judging --need-gb
+for _ in $(seq "$FREE_WAIT"); do
+  [ "$NEED_GB" -gt 0 ] && [[ "$FREE" =~ ^[0-9]+$ ]] &&
+    [ $(( TOTAL_MB * FREE / 100 )) -lt $(( (NEED_GB + HEADROOM_GB) * 1024 )) ] || break
+  sleep 1
+  FREE=$(free_pct)
+done
+DISK=$(df -g "$MODELS" | awk 'NR == 2 { print $4 }')
+AC=0 DOCKER=0
+pmset -g batt | grep -q 'AC Power' && AC=1
+pgrep -qf 'com\.docker\.backend' && DOCKER=1 # comm is truncated, so -f
+log "preflight wired_mb=$WIRED $PROBE free_pct=$FREE total_mb=$TOTAL_MB need_gb=$NEED_GB disk_gb=$DISK ac=$AC docker=$DOCKER"
+
+ERRORS=
+fail() { ERRORS="$ERRORS"$'\n'"  - $*"; log "preflight_fail $*"; }
+# wired limit 0 = system default; empty, non-numeric and -1 (unreadable) values fail closed
+[ "$WIRED" -le "$MAX_WIRED_MB" ] 2>/dev/null || fail "GPU wired limit iogpu.wired_limit_mb=$WIRED (allowed: 0 = default, or <= $MAX_WIRED_MB)"
+# stale swap persists until reboot: parallel tolerates more (growth is still capped by the watchdog),
+# exclusive (benchmarks) wants a clean machine
+SWAP_LIMIT=$MAX_SWAP_MB
+[ "$PROFILE" = parallel ] && SWAP_LIMIT=$MAX_SWAP_PARALLEL_MB
+[ "$SWAP" -ge 0 ] 2>/dev/null && [ "$SWAP" -lt "$SWAP_LIMIT" ] ||
+  fail "swap in use: ${SWAP} MiB (allowed: < $SWAP_LIMIT MiB, -1 = unreadable). Close big apps or restart the Mac."
+[ "$FREE" -ge "$MIN_FREE_PCT" ] 2>/dev/null || fail "free memory: ${FREE} % (needed: >= $MIN_FREE_PCT %). Close big apps."
+# --need-gb: the model must fit into free memory with headroom, or loading pushes other apps into swap
+FREE_MB=0
+[ "$FREE" -ge 0 ] 2>/dev/null && FREE_MB=$(( TOTAL_MB * FREE / 100 ))
+[ "$NEED_GB" -eq 0 ] || [ "$FREE_MB" -ge $(( (NEED_GB + HEADROOM_GB) * 1024 )) ] ||
+  fail "not enough free RAM: $FREE_MB MiB free, needs $(( NEED_GB + HEADROOM_GB )) GiB ($NEED_GB for the model + $HEADROOM_GB reserve). Close big apps (Docker, browsers) or use --spar."
+[ "$LEVEL" -ge 0 ] 2>/dev/null && [ "$LEVEL" -lt "$PRESSURE_CRITICAL" ] ||
+  fail "memory pressure critical or unreadable (level $LEVEL)"
+[ "$DISK" -ge "$MIN_DISK_GB" ] 2>/dev/null || fail "free disk at $MODELS: ${DISK} GiB (needed: >= $MIN_DISK_GB GiB)"
+if [ "$AC" != 1 ]; then
+  if [ "$PROFILE" = exclusive ]; then
+    fail "on battery (benchmarks need the power adapter)"
+  else
+    say "warning: on battery, the model drains it fast"
+    log "warning battery"
+  fi
+fi
+if [ "$DOCKER" = 1 ]; then
+  if [ "$PROFILE" = exclusive ]; then
+    fail "Docker Desktop is running (benchmarks need it closed)"
+  else
+    say "warning: Docker Desktop is running and uses RAM"
+    log "warning docker_running"
+  fi
+fi
+if [ -n "$ERRORS" ]; then
+  say "not started:$ERRORS"
+  exit 3
+fi
+
+# --- run: own process group (watchdog kills the whole tree). The child takes the terminal
+# foreground only if the guard has it (not as a background job) and ignores Ctrl-Z, which would
+# stop it while the guard keeps waiting. "<&0" keeps stdin, bash gives background jobs /dev/null.
+FG=$(perl -MPOSIX -e 'print -t 0 && tcgetpgrp(0) == getpgrp ? 1 : 0')
+perl -MPOSIX -e '$SIG{TTOU} = $SIG{TSTP} = "IGNORE"; my $fg = shift; setpgrp(0, 0);
+  tcsetpgrp(0, $$) if $fg; exec @ARGV or die "exec: $!\n"' "$FG" caffeinate -i "$@" <&0 &
+CHILD=$!
+log "child pgid=$CHILD"
+watchdog 9>&- >/dev/null 2>&1 & # 9>&-: its sleep must not hold the lock after the run
+WD=$!
+
+wait "$CHILD"
+RC=$?
+kill "$WD" 2>/dev/null; WD=
+stop_group # leftovers in the child's group
+log "child_exit=$RC"
+REASON=$(LC_ALL=C sed -n 's/.* watchdog_kill //p' "$LOG_FILE")
+if [ -n "$REASON" ]; then
+  say "stopped by the memory watchdog ($REASON, exit $RC): macOS started to swap. Close apps or use --spar."
+  exit 4
+fi
+probe
+sample
+exit "$RC"

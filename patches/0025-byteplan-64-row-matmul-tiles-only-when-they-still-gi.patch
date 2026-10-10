@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sun, 11 Oct 2026 13:01:11 +0200
+Subject: [PATCH 25/27] byteplan: 64-row matmul tiles only when they still give
+ 512+ threadgroups
+
+A narrow matrix with long rows (the 320-row hc down, K = 10240) ran 30 % slower with 64 src1 rows per threadgroup
+(80 threadgroups for 40 GPU cores); 512 rows 10 % slower, 2560 rows 3 % faster. Same tiles per element either way.
+---
+ ggml/src/ggml-metal/ggml-metal-device.cpp | 6 ++++--
+ tests/test-backend-ops.cpp                | 4 ++++
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 8980500..3c102cc 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -955,8 +955,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
+ 
+     const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
+ 
+-    // byteplan: 64 src1 rows per threadgroup for large batches (prefill), see FC_mul_mm_r64
+-    const bool r64 = !has_tensor && op->src[1]->ne[1] >= 512;
++    // byteplan: 64 src1 rows per threadgroup for large batches (prefill), see FC_mul_mm_r64, when that still gives
++    // 512+ threadgroups (a narrow matrix with long rows, like the 320-row hc down, needs the parallelism of 32)
++    const int64_t ntg64 = ((op->src[0]->ne[1] + 63)/64)*((op->src[1]->ne[1] + 63)/64);
++    const bool r64 = !has_tensor && op->src[1]->ne[1] >= 512 && ntg64 >= 512;
+ 
+     const bool bc_out = has_tensor
+         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 5137513..ba07126 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11878,6 +11878,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
+         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, 1024, 2560, {1, 1}, {1, 1}));
+     }
++    // hyper-connection down: few rows, long K
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 320, 1024, 10240, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 2560, 1024, 6144, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 1024, 2560, {1, 1}, {1, 1}));
+ 
+     // byteplan: qwen4exp expert prefill, 512 experts top-10 in Q2_0: gate/up (shared token rows) and down
+     for (int bs : {1024, 2048}) {
+-- 
+2.53.0
+

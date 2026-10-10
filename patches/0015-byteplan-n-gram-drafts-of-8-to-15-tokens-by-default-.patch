@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sat, 10 Oct 2026 17:31:20 +0200
+Subject: [PATCH 15/27] byteplan: n-gram drafts of 8 to 15 tokens by default
+ (verify stays on the few-row kernels)
+
+---
+ common/common.h | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/common/common.h b/common/common.h
+index 814cdf9..cdbbdba 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -355,10 +355,12 @@ struct common_params_speculative_draft {
+ };
+ 
+ struct common_params_speculative_ngram_mod {
+-    int32_t n_match = 24;
++    // byteplan: drafts of 8..15 tokens keep a verify batch (draft + 1 token) at <= 16 rows, where Metal still uses the
++    // few-row matmul kernels; with more rows it switches to mul_mm and checking costs much more (was 24/48/64)
++    int32_t n_match = 16;
+ 
+-    int32_t n_max = 64;
+-    int32_t n_min = 48;
++    int32_t n_max = 15;
++    int32_t n_min = 8;
+ };
+ 
+ struct common_params_speculative_ngram_map {
+-- 
+2.53.0
+

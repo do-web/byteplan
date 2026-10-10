@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sun, 11 Oct 2026 00:51:48 +0200
+Subject: [PATCH 19/27] byteplan: Metal op profile prints the source tensor,
+ its type and size, and the output shape
+
+GGML_METAL_OP_PROFILE lines get five more columns: src0 name, src0 type, src0 bytes, src1 rows and the output shape, so matrix products can be ranked by GB/s and slow small ops found by shape. The first six columns stay as before.
+---
+ ggml/src/ggml-metal/ggml-metal-context.m | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 80b9050..d7bb841 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -499,7 +499,10 @@ static enum ggml_status ggml_metal_graph_compute_op_profile(ggml_metal_t ctx, st
+                 const size_t len = strlen(ops);
+                 snprintf(ops + len, sizeof(ops) - len, "%s%s", k ? "+" : "", ggml_op_desc(gf->nodes[ggml_metal_op_node_idx(ctx_op, k)]));
+             }
+-            const char * name = res > 0 ? gf->nodes[ggml_metal_op_node_idx(ctx_op, 0)]->name : "";
++            const struct ggml_tensor * first = res > 0 ? gf->nodes[ggml_metal_op_node_idx(ctx_op, 0)] : NULL;
++            const char * name = first ? first->name : "";
++            // weights of a matrix product: name, type, bytes, rows of src1 (to rank kernels by GB/s)
++            const struct ggml_tensor * w = first ? first->src[0] : NULL;
+             const int next = ggml_metal_op_node_idx(ctx_op, res);
+ 
+             ggml_metal_op_free(ctx_op);
+@@ -516,7 +519,9 @@ static enum ggml_status ggml_metal_graph_compute_op_profile(ggml_metal_t ctx, st
+                 return GGML_STATUS_FAILED;
+             }
+ 
+-            fprintf(stderr, "opprof\t%d\t%s\t%s\t%d\t%.2f\n", n_graph, ops, name, res, ([cmd_buf GPUEndTime] - [cmd_buf GPUStartTime])*1e6);
++            fprintf(stderr, "opprof\t%d\t%s\t%s\t%d\t%.2f\t%s\t%s\t%zu\t%lld\t%lldx%lldx%lld\n", n_graph, ops, name, res, ([cmd_buf GPUEndTime] - [cmd_buf GPUStartTime])*1e6,
++                    w ? w->name : "", w ? ggml_type_name(w->type) : "", w ? ggml_nbytes(w) : 0, w && first->src[1] ? (long long) first->src[1]->ne[1] : 0LL,
++                    first ? (long long) first->ne[0] : 0LL, first ? (long long) first->ne[1] : 0LL, first ? (long long) first->ne[2] : 0LL);
+ 
+             start = next;
+         }
+-- 
+2.53.0
+

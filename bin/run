@@ -1,0 +1,303 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""Chat with (almost) any Hugging Face model: downloads it, converts it to GGUF once if needed, starts the web UI.
+
+  bin/run Qwen/Qwen3-8B-GGUF                 ready-made GGUF: picks the best file that fits your memory
+  bin/run Qwen/Qwen3-8B-GGUF:Q4_K_M          pick a size yourself (smaller = faster, bigger = more accurate)
+  bin/run https://huggingface.co/Qwen/Qwen3-8B    original weights: converted once, then cached
+  bin/run ~/Downloads/model.gguf             a file on your Mac
+  bin/run qwen3 8b                           not sure about the name: shows matching models
+
+Options: --ctx N (context in tokens, default 32768); everything else goes to llama-server (e.g. --agent).
+Models are stored in $BYTEPLAN_MODELS (default ~/byteplan-models) under hf/ and compiled/.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+D = Path(os.environ.get("BYTEPLAN_MODELS", Path.home() / "byteplan-models"))
+BIN = ROOT / "build" / "bin"
+SRC = ROOT / "vendor" / "llama.cpp"
+GB = 1 << 30
+RAM = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True).stdout)
+# ponytail: rule of thumb to pick a file before it is downloaded (macOS lets the GPU use ~13/16 of RAM, 8 GB stay for
+# context and apps); the guard later gets the exact need from llama fit-params
+BUDGET = RAM * 13 // 16 - 8 * GB
+KEEP_FREE = 30 * GB  # same disk reserve as bin/run-guarded (MIN_DISK_GB)
+# bytes per parameter of the types a conversion can produce; CONVERT = automatic choice, most accurate first
+BPP = {"Q8_0": 1.07, "Q6_K": 0.83, "Q5_K_M": 0.72, "Q4_K_M": 0.61, "Q3_K_M": 0.49, "Q2_K": 0.42, "BF16": 2, "F16": 2, "F32": 4}
+CONVERT = ["Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q3_K_M", "Q2_K"]
+FULL = ("BF16", "F16", "F32")
+TAG = re.compile(r"(?i)(?:UD-)?(?:I?Q\d_[A-Z0-9_]*[A-Z0-9]|MXFP4(?:_MOE)?|BF16|F16|F32)")
+SPLIT = re.compile(r"-\d{5}-of-\d{5}(?=\.gguf$)")
+SIDE_FILES = ("dflash-", "eagle3-", "dspark-", "draft-")
+META = {"config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
+        "tokenizer.model", "vocab.json", "merges.txt", "vocab.txt", "added_tokens.json", "chat_template.jinja",
+        "chat_template.json", "preprocessor_config.json", "processor_config.json", "model.safetensors.index.json"}
+
+
+def die(msg: str):
+    sys.exit(f"bin/run: {msg}")
+
+
+def gb(n: float) -> str:
+    return f"{n / GB:.1f} GB"
+
+
+def slug(repo: str) -> str:
+    return repo.replace("/", "__")
+
+
+def token() -> str | None:
+    if os.environ.get("HF_TOKEN"):
+        return os.environ["HF_TOKEN"]
+    f = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "token"
+    return f.read_text().strip() if f.exists() else None
+
+
+def api(path: str):
+    req = urllib.request.Request("https://huggingface.co" + path)
+    if tok := token():
+        req.add_header("Authorization", f"Bearer {tok}")
+    try:
+        return json.load(urllib.request.urlopen(req, timeout=60))
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            die("this model is gated: accept its license on huggingface.co, then run `hf auth login` once")
+        if e.code in (401, 404):  # Hugging Face answers 401 for unknown and for private repos
+            die("not found on Hugging Face. Check the name (e.g. Qwen/Qwen3-8B-GGUF); "
+                "gated or private models also need `hf auth login`")
+        raise
+
+
+def hf_download(repo: str, files: list[str], dest: Path) -> None:
+    """hf resumes partial files; like tools/fetch_models.sh plain HTTP (Xet stalled for hours) and retries."""
+    missing = [f for f in files if not (dest / f).exists()]
+    if not missing:
+        return
+    hf = ["hf"] if shutil.which("hf") else ["uvx", "--from", "huggingface_hub", "hf"]
+    env = dict(os.environ, HF_HUB_DISABLE_XET=os.environ.get("HF_HUB_DISABLE_XET", "1"))
+    for attempt in range(1, 21):
+        if subprocess.run([*hf, "download", repo, *missing, "--local-dir", str(dest)], env=env).returncode == 0:
+            return
+        print(f"download interrupted, retry {attempt} of 20 in 15 s", file=sys.stderr)
+        time.sleep(15)
+    die("download failed; check the internet connection and run the same command again (it resumes)")
+
+
+def check_disk(missing_bytes: int, extra: int = 0) -> None:
+    D.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(D).free
+    if free - missing_bytes - extra < KEEP_FREE:
+        die(f"not enough disk: needs {gb(missing_bytes + extra)} + {gb(KEEP_FREE)} reserve, {gb(free)} free at {D}")
+
+
+def parse(spec: str) -> tuple[str | None, str | None, str | None]:
+    """-> (repo, tag or file in the repo, local path); (None, None, None) = not an address"""
+    if Path(spec).expanduser().is_file():
+        return None, None, str(Path(spec).expanduser().resolve())
+    s = re.sub(r"^(https?://)?(www\.)?(huggingface\.co|hf\.co)/", "", spec).split("?")[0].rstrip("/")
+    if spec.startswith(("/", "~", ".")) or ("/" not in s and s.endswith(".gguf")):
+        die(f"file not found: {spec}")
+    s, _, tag = s.partition(":")
+    parts = s.split("/")
+    if len(parts) < 2 or not all(re.fullmatch(r"[\w.-]+", x) for x in parts[:2]):
+        return None, None, None
+    rest = parts[2:]
+    if rest[:1] in (["blob"], ["resolve"], ["tree"]):
+        rest = rest[2:]  # blob/<branch>/...
+    file = "/".join(rest)
+    return "/".join(parts[:2]), file if file.endswith(".gguf") else tag or None, None
+
+
+def search(words: str):
+    hits = api(f"/api/models?search={urllib.parse.quote(words)}&sort=downloads&direction=-1&limit=8")
+    if not hits:
+        die(f"no model matches '{words}' on Hugging Face")
+    print(f"'{words}' is not a model address. Popular matches:\n")
+    for h in hits:
+        print(f"  bin/run {h['id']}")
+    die("pick one (names ending in -GGUF start fastest)")
+
+
+def tag_of(name: str) -> str:
+    tags = TAG.findall(Path(name).name)
+    return tags[-1].upper() if tags else Path(SPLIT.sub("", name)).stem
+
+
+def gguf_repo(repo: str, want: str | None, files: list[dict]) -> tuple[Path, Path | None, Path | None]:
+    sizes = {f["path"]: f.get("size", 0) for f in files if f["path"].endswith(".gguf")}
+    mmprojs = [p for p in sizes if "mmproj" in Path(p).name.lower()]
+    mtps = [p for p in sizes if Path(p).name.startswith("mtp-")]
+    groups: dict[str, list[str]] = {}
+    for p in sizes:
+        # other draft heads and importance matrices ship next to the model in some repos; they are not the model
+        if p in mmprojs or p in mtps or Path(p).name.lower().startswith(SIDE_FILES) or "imatrix" in Path(p).name.lower():
+            continue
+        groups.setdefault(SPLIT.sub("", p), []).append(p)
+    size = {k: sum(sizes[p] for p in v) for k, v in groups.items()}
+    mmproj = min(mmprojs, key=lambda p: ({"F16": 0, "BF16": 1}.get(tag_of(p), 2), sizes[p]), default=None)
+    if want and want.endswith(".gguf"):
+        pick = [k for k in groups if want in groups[k] or k == want]
+    elif want:
+        pick = [k for k in groups if re.search(rf"(?i)(^|[-_./]){re.escape(want)}([-_./]|$)", k)]
+    else:
+        budget = BUDGET - (sizes[mmproj] if mmproj else 0)
+        fits = [k for k in groups if size[k] <= budget]
+        if not fits:
+            die(f"too big for this Mac: the smallest file is {gb(min(size.values()))}, about {gb(budget)} fit here")
+        # Q8_0 is practically lossless and twice as fast as 16 bit; otherwise the biggest file that fits
+        q8 = [k for k in fits if tag_of(k) == "Q8_0"]
+        quant = [k for k in fits if tag_of(k) not in FULL]
+        pick = q8 or [max(quant or fits, key=size.get)]
+    if not pick:
+        die(f"no file matches '{want}'. Available: {', '.join(sorted({tag_of(k) for k in groups}))}")
+    model = pick[0]
+    if size[model] > BUDGET:
+        print(f"Warning: {tag_of(model)} needs {gb(size[model])}, more than the ~{gb(BUDGET)} this Mac can use well.")
+    mtp = min(mtps, key=lambda p: (tag_of(p) != tag_of(model), tag_of(p) != "Q8_0", sizes[p]), default=None)
+    want_files = groups[model] + [p for p in (mmproj, mtp) if p]
+    dest = D / "hf" / slug(repo)
+    check_disk(sum(sizes[p] for p in want_files if not (dest / p).exists()))
+    print(f"Model: {repo} {tag_of(model)} ({gb(size[model])})" + (" + vision" if mmproj else "") + (" + MTP" if mtp else ""))
+    hf_download(repo, want_files, dest)
+    return dest / sorted(groups[model])[0], dest / mmproj if mmproj else None, dest / mtp if mtp else None
+
+
+def strip_remote_code(folder: Path) -> None:
+    """auto_map makes transformers fetch and run Python code from a repo; the converter never needs it."""
+    for f in folder.glob("*.json"):
+        d = json.loads(f.read_text())
+        if isinstance(d, dict) and "auto_map" in d:
+            d.pop("auto_map")
+            f.write_text(json.dumps(d, indent=2))
+
+
+def compile_repo(repo: str, want: str | None, files: list[dict]) -> tuple[Path, Path | None, Path | None]:
+    top = {f["path"]: f.get("size", 0) for f in files if "/" not in f["path"]}
+    st = {p: n for p, n in top.items() if p.endswith(".safetensors")}
+    if "adapter_config.json" in top:
+        die("this is a LoRA adapter, not a full model")
+    if not st:
+        die("no GGUF or safetensors weights in this repository")
+    params = (api(f"/api/models/{repo}").get("safetensors") or {}).get("total") or sum(st.values()) // 2
+    qtype = want.upper() if want else next((q for q in CONVERT if params * BPP[q] <= BUDGET), None)
+    if not qtype:
+        die(f"too big for this Mac: even 2-bit needs {gb(params * BPP['Q2_K'])}, about {gb(BUDGET)} fit here")
+    if qtype not in BPP:
+        die(f"can convert to {', '.join(BPP)}, not '{want}'")
+    out = D / "compiled" / f"{slug(repo)}-{qtype}.gguf"
+    mmproj = D / "compiled" / f"{slug(repo)}-mmproj.gguf"
+    if out.exists():
+        print(f"Model: {out.name} (compiled before)")
+    else:
+        convert(repo, top, st, qtype, params, out, mmproj)
+    return out, mmproj if mmproj.exists() else None, None
+
+
+def convert(repo: str, top: dict, st: dict, qtype: str, params: int, out: Path, mmproj: Path) -> None:
+    src = D / "hf-src" / slug(repo)
+    hf_download(repo, sorted(META & top.keys()), src)
+    cfg = json.loads((src / "config.json").read_text()) if (src / "config.json").exists() else {}
+    if "quantization_config" in cfg:
+        die("these weights are already quantized (GPTQ/AWQ/FP8); use a GGUF version of this model instead")
+    index = src / "model.safetensors.index.json"
+    weights = sorted(set(json.loads(index.read_text())["weight_map"].values())) if index.exists() else list(st)
+    direct = qtype == "Q8_0" or qtype in FULL  # the converter writes these itself
+    out_bytes = int(params * BPP[qtype])
+    missing = sum(st.get(p, 0) for p in weights if not (src / p).exists())
+    check_disk(missing, out_bytes + (0 if direct else 2 * params))
+    print(f"Compiling {repo} to {qtype} (~{gb(out_bytes)}). One time only; downloads {gb(missing)} first,\n"
+          "the first conversion also installs the converter (~1 GB).")
+    hf_download(repo, weights, src)
+    strip_remote_code(src)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
+    conv = ["uv", "run", "--quiet", "--python", "3.12", "--with-requirements",
+            str(SRC / "requirements" / "requirements-convert_hf_to_gguf.txt"), "python", str(SRC / "convert_hf_to_gguf.py"), str(src)]
+    part = out.with_name(out.name + ".part")
+    tmp = out.with_name(out.name + ".bf16.part")
+    try:
+        if direct:
+            subprocess.run([*conv, "--outtype", qtype.lower(), "--outfile", str(part)], env=env, check=True)
+        else:
+            subprocess.run([*conv, "--outtype", "bf16", "--outfile", str(tmp)], env=env, check=True)
+            subprocess.run([str(BIN / "llama-quantize"), str(tmp), str(part), qtype], check=True)
+        if "vision_config" in cfg and not mmproj.exists():  # vision models: the image encoder is a second file
+            if subprocess.run([*conv, "--mmproj", "--outtype", "f16", "--outfile", str(mmproj)], env=env).returncode:
+                print("Note: could not convert the image part; the model will run text-only.")
+                mmproj.unlink(missing_ok=True)
+        part.rename(out)
+    except subprocess.CalledProcessError:
+        die("conversion failed (see the lines above). Many models also exist as ready-made GGUF: "
+            "search with `bin/run <model name> gguf`")
+    finally:
+        tmp.unlink(missing_ok=True)
+        part.unlink(missing_ok=True)
+    shutil.rmtree(src)  # the original weights are not needed any more
+
+
+def need_gb(model: Path, ctx: str, extra: int) -> int:
+    """Memory for the guard: llama fit-params prints model, context and compute MiB per device (metadata only)."""
+    r = subprocess.run([str(BIN / "llama"), "fit-params", "-m", str(model), "-c", ctx, "--fit-print", "on"],
+                       capture_output=True, text=True)
+    mib = sum(int(x) for line in r.stdout.splitlines() for x in line.split()[1:] if x.isdigit())
+    if r.returncode or not mib:  # ponytail: file size + 3 GB for context if fit-params cannot tell
+        mib = sum(p.stat().st_size for p in model.parent.glob(SPLIT.sub("-*-of-*", model.name))) // 2**20 + 3072
+    return -(-(mib * 2**20 + extra) // GB) + 1
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    ctx = "32768"
+    if "--ctx" in args:
+        i = args.index("--ctx")
+        ctx = (args[i + 1:i + 2] or [""])[0]
+        del args[i:i + 2]
+        if not ctx.isdigit():
+            die("--ctx needs a number of tokens, e.g. --ctx 65536")
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        return
+    server = BIN / "llama-server"
+    if not server.exists():
+        die("not installed yet: run ./install.sh --no-model")
+    repo, want, local = parse(args[0])
+    mmproj = mtp = None
+    if local:
+        model = Path(local)
+    elif repo:
+        files = [f for f in api(f"/api/models/{repo}/tree/main?recursive=true") if f.get("type") == "file"]
+        if any(f["path"].endswith(".gguf") for f in files):
+            model, mmproj, mtp = gguf_repo(repo, want, files)
+        else:
+            model, mmproj, mtp = compile_repo(repo, want, files)
+    else:
+        search(" ".join(a for a in args if not a.startswith("-")))
+
+    need = need_gb(model, ctx, sum(p.stat().st_size for p in (mtp, mmproj) if p))
+    env = ["GGML_METAL_N_CB=8", f"BYTEPLAN_PROMPT_DISK={D / 'prompt-cache'}"]
+    cmd = [str(server), "-m", str(model), "-c", ctx, "-np", "1", "--cache-ram", "0", "--ctx-checkpoints", "8",
+           "--checkpoint-min-step", "1024", "--host", "127.0.0.1", "--port", "8080"]
+    cmd += ["-md", str(mtp), "--spec-type", "draft-mtp,ngram-mod", "--spec-draft-n-max", "3"] if mtp else ["--spec-type", "ngram-mod"]
+    if mmproj:
+        env.append("BYTEPLAN_MMPROJ_LAZY_GPU=1")
+        cmd += ["--mmproj", str(mmproj), "--no-mmproj-offload"]
+    print(f"Starting: open http://127.0.0.1:8080 (needs ~{need} GB free memory, stop with Ctrl-C)", flush=True)
+    guard = [str(ROOT / "bin" / "run-guarded"), "--profile", "parallel", "--need-gb", str(need), "--", "env", *env]
+    os.execvpe(guard[0], guard + cmd + args[1:], dict(os.environ, BYTEPLAN_MODELS=str(D)))
+
+
+if __name__ == "__main__":
+    main()

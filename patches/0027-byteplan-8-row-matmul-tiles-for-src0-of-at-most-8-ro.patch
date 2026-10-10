@@ -1,0 +1,300 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sun, 11 Oct 2026 14:07:58 +0200
+Subject: [PATCH 27/27] byteplan: 8-row matmul tiles for src0 of at most 8 rows
+
+The 4-row hc inject ran in a 64-row tile with 60 rows of padding: kernel_mul_mm_n8 takes 8 src0 rows and 8 src1 rows
+per threadgroup (one simdgroup), with the same MMA sequence per element. 4 x 2048 x 10240 q8_0: 428 -> 312 us.
+---
+ ggml/src/ggml-metal/ggml-metal-device.cpp |  39 ++++++
+ ggml/src/ggml-metal/ggml-metal-device.h   |   1 +
+ ggml/src/ggml-metal/ggml-metal-impl.h     |   3 +
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    |   5 +-
+ ggml/src/ggml-metal/kernels/mul_mm.metal  | 155 ++++++++++++++++++++++
+ tests/test-backend-ops.cpp                |   5 +
+ 6 files changed, 207 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 3c102cc..837974b 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -1009,6 +1009,45 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
+     return res;
+ }
+ 
++// byteplan: src0 with at most 8 rows (see kernel_mul_mm_n8)
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_n8(ggml_metal_library_t lib, const ggml_tensor * op) {
++    char base[256];
++    char name[256];
++
++    const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
++
++    GGML_ASSERT(op->src[1]->ne[2] <= INT16_MAX && op->src[1]->ne[3] <= INT16_MAX);
++    const int16_t ne12 = (int16_t) op->src[1]->ne[2];
++    const int16_t ne13 = (int16_t) op->src[1]->ne[3];
++    const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
++    const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
++
++    snprintf(base, 256, "kernel_mul_mm_n8_%s_%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type));
++    snprintf(name, 256, "%s_bci=%d_ne12=%d_ne13=%d_r2=%d_r3=%d", base, bc_inp, ne12, ne13, r2, r3);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        ggml_metal_cv_t cv = ggml_metal_cv_init();
++
++        ggml_metal_cv_set_bool (cv, bc_inp, FC_MUL_MM + 0);
++        ggml_metal_cv_set_int16(cv, ne12,   FC_MUL_MM + 2);
++        ggml_metal_cv_set_int16(cv, ne13,   FC_MUL_MM + 3);
++        ggml_metal_cv_set_int16(cv, r2,     FC_MUL_MM + 4);
++        ggml_metal_cv_set_int16(cv, r3,     FC_MUL_MM + 5);
++
++        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
++
++        ggml_metal_cv_free(cv);
++    }
++
++    res.nr0  = 8;
++    res.nr1  = 8*N_MM_N8_NSG;
++    res.nsg  = N_MM_N8_NSG;
++    res.smem = 4096 + 2048;
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
+     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 6ce37e0..3525db6 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -139,6 +139,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ex
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nt, int rt, bool add);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma_auto   (ggml_metal_library_t lib, const struct ggml_tensor * op, bool add);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_n8        (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20, bool cnt);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax(ggml_metal_library_t lib);
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index c13af2c..6d26af5 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -19,6 +19,9 @@
+ // byteplan: tokens per threadgroup of the mul_mm_id expert map
+ #define N_MM_ID_MAP_CHUNK 32
+ 
++// byteplan: simdgroups (8 src1 rows each) per threadgroup of kernel_mul_mm_n8
++#define N_MM_N8_NSG 1
++
+ // kernel parameters for mat-vec threadgroups
+ //
+ // N_R0: number of src0 rows to process per simdgroup
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 72db100..b6c308e 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2798,7 +2798,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+         //    default: break;
+         //}
+ 
+-        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op);
++        // byteplan: an src0 of at most 8 rows (the 4-row hc inject) takes 8-row tiles, see kernel_mul_mm_n8
++        const bool n8 = !props_dev->has_tensor && ne01 <= 8 && op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1]->type == GGML_TYPE_F32;
++
++        auto pipeline = n8 ? ggml_metal_library_get_pipeline_mul_mm_n8(lib, op) : ggml_metal_library_get_pipeline_mul_mm(lib, op);
+ 
+         ggml_metal_kargs_mul_mm args = {
+             /*.ne00 =*/ ne00,
+diff --git a/ggml/src/ggml-metal/kernels/mul_mm.metal b/ggml/src/ggml-metal/kernels/mul_mm.metal
+index 800a82e..e9cca66 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mm.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mm.metal
+@@ -374,6 +374,161 @@ kernel void kernel_mul_mm(
+ 
+ #endif // GGML_METAL_HAS_TENSOR
+ 
++// byteplan: src0 with at most 8 rows (the 4-row hc inject): one 8-row tile per threadgroup instead of a 64-row tile
++// with 60 rows of padding; each output element sees the same MMA sequence as in kernel_mul_mm
++template<
++    typename S0, typename S0_4x4, typename S0_8x8,
++    typename S1, typename S1_2x4, typename S1_8x8,
++    typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &),
++    typename T0, typename T0_4x4, typename T1, typename T1_2x4>
++kernel void kernel_mul_mm_n8(
++        constant ggml_metal_kargs_mul_mm & args,
++        device const char * src0,
++        device const char * src1,
++        device       char * dst,
++        threadgroup  char * shmem [[threadgroup(0)]],
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiitg[[thread_index_in_threadgroup]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
++
++    threadgroup S0 * sa = (threadgroup S0 *)(shmem);
++    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
++
++    constexpr int NR0 = 8;
++    constexpr int NSG = N_MM_N8_NSG;
++    constexpr int NR1 = 8*NSG;
++
++    constexpr int NK  = 32;
++    constexpr int NL0 = NK/16;
++    constexpr int NL1 = NK/8;
++
++    const int im = tgpig.z;
++    const int r1 = tgpig.x*NR1;
++
++    const short nr0 = args.ne0 < NR0 ? args.ne0 : NR0;
++    const short nr1 = (args.ne1 - r1 < NR1) ? (args.ne1 - r1) : NR1;
++
++    // threads 0..15 load the 8 x 32 src0 block, all 128 the 32 x 32 src1 block
++    const bool  la  = tiitg < NR0*NL0;
++    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
++    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
++
++    const short il0 = (tiitg % NL0);
++
++    short il = il0;
++
++    const int i12 = im % FC_mul_mm_ne12;
++    const int i13 = im / FC_mul_mm_ne12;
++
++    const uint64_t offset0 = (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03;
++    const short    offset1 = il0/nl;
++
++    device const block_q * x = (device const block_q *)(src0 + args.nb01*lr0 + offset0) + offset1;
++
++    const short iy = 8*(tiitg % NL1);
++
++    device const T1 * y = (device const T1 *)(src1
++        + args.nb13*i13
++        + args.nb12*i12
++        + args.nb11*(r1 + lr1)
++        + args.nb10*iy);
++
++    S0_8x8 ma;
++    S1_8x8 mb;
++
++    simdgroup_float8x8 mc = make_filled_simdgroup_matrix<float, 8>(0.f);
++
++    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
++        if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
++            threadgroup_barrier(mem_flags::mem_threadgroup);
++
++            if (la) {
++                for (short i = 0; i < 16; i++) {
++                    const short sx = 2*il0 + i/8;
++                    const short lx = (tiitg/NL0)%8;
++                    const short ly = i%8;
++
++                    *(sa + 64*sx + 8*ly + lx) = loop_k + 16*il + i < args.ne00 ? (S0) *((device T0 *) x + i) : 0;
++                }
++            }
++        } else {
++            S0_4x4 temp_a;
++            if (la) {
++                dequantize_func(x, il, temp_a);
++            }
++
++            threadgroup_barrier(mem_flags::mem_threadgroup);
++
++            if (la) {
++                FOR_UNROLL (short i = 0; i < 16; i++) {
++                    const short sx = 2*il0 + i/8;
++                    const short lx = (tiitg/NL0)%8;
++                    const short ly = i%8;
++
++                    *(sa + 64*sx + 8*ly + lx) = temp_a[i/4][i%4];
++                }
++            }
++        }
++
++        if (FC_mul_mm_bc_inp) {
++            for (short i = 0; i < 8; ++i) {
++                const short sx = (tiitg%NL1);
++                const short sy = (tiitg/NL1)/8;
++
++                const short lx = i;
++                const short ly = (tiitg/NL1)%8;
++
++                const short ib = NSG*sx + sy;
++
++                *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
++            }
++        } else {
++            const short sx = (tiitg%NL1);
++            const short sy = (tiitg/NL1)/8;
++
++            const short ly = (tiitg/NL1)%8;
++
++            const short ib = NSG*sx + sy;
++
++            *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y));
++        }
++
++        il = (il + 2 < nl) ? il + 2 : il % 2;
++        x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
++
++        y += NK;
++
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        // simdgroup s: src1 rows 8s..8s+7 against all 8 src0 rows
++        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
++            simdgroup_load(ma, sa + 64*ik, 8, 0, false);
++            simdgroup_load(mb, sb + 64*(NSG*ik + sgitg), 8, 0, false);
++
++            simdgroup_multiply_accumulate(mc, mb, ma, mc);
++        }
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    threadgroup float * temp = (threadgroup float *) shmem;
++
++    simdgroup_store(mc, temp + 8*NR0*sgitg, NR0, 0, false);
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    for (int i = tiitg; i < nr1*nr0; i += NSG*N_SIMDWIDTH) {
++        const int j  = i/nr0;
++        const int i0 = i%nr0;
++
++        *((device float *) dst + i0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0) = temp[j*NR0 + i0];
++    }
++}
++
++typedef decltype(kernel_mul_mm_n8<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_n8_t;
++
++template [[host_name("kernel_mul_mm_n8_q8_0_f32")]] kernel mul_mm_n8_t kernel_mul_mm_n8<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
++
+ // byteplan: the expert map runs as one threadgroup per chunk of N_MM_ID_MAP_CHUNK tokens instead of a single
+ // threadgroup scanning all tokens on one GPU core: map0_cnt counts the rows of each expert per chunk, map0 writes
+ // them after the rows of the earlier chunks - the same lists in the same order
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index ba07126..f9f5925 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11420,6 +11420,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {12, 2}, 8192, 67, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
++    // byteplan: src0 of at most 8 rows (kernel_mul_mm_n8), partial token tiles and batches
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4, 100, 1024, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 7, 64, 512, {2, 1}, {1, 1}));
+     // byteplan: the QSA prefill budget (2048 + compress ratio - 1), heads of a KV group per threadgroup
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051));
+ 
+@@ -11882,6 +11885,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 320, 1024, 10240, {1, 1}, {1, 1}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 2560, 1024, 6144, {1, 1}, {1, 1}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 1024, 2560, {1, 1}, {1, 1}));
++    // hyper-connection inject: 4 rows
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4, 2048, 10240, {1, 1}, {1, 1}));
+ 
+     // byteplan: qwen4exp expert prefill, 512 experts top-10 in Q2_0: gate/up (shared token rows) and down
+     for (int bs : {1024, 2048}) {
+-- 
+2.53.0
+

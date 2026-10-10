@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Thu, 8 Oct 2026 23:09:25 +0200
+Subject: [PATCH 02/27] byteplan: per-op GPU timing for Metal (env
+ GGML_METAL_OP_PROFILE, default off)
+
+---
+ ggml/src/ggml-metal/ggml-metal-context.m | 60 ++++++++++++++++++++++++
+ ggml/src/ggml-metal/ggml-metal-ops.cpp   |  8 ++++
+ ggml/src/ggml-metal/ggml-metal-ops.h     |  3 ++
+ 3 files changed, 71 insertions(+)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index e906466..0739e46 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -42,6 +42,7 @@ struct ggml_metal {
+     bool use_graph_optimize;
+ 
+     int debug_graph;
++    bool op_profile; // byteplan: GGML_METAL_OP_PROFILE
+ 
+     struct ggml_metal_fusion_info * finfo;
+ 
+@@ -146,6 +147,8 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
+             res->debug_graph = val ? atoi(val) : 0;
+         }
+ 
++        res->op_profile = getenv("GGML_METAL_OP_PROFILE") != nil;
++
+         res->use_graph_optimize = true;
+ 
+         if (getenv("GGML_METAL_GRAPH_OPTIMIZE_DISABLE") != NULL) {
+@@ -471,6 +474,59 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
+     }
+ }
+ 
++// byteplan: GGML_METAL_OP_PROFILE=1 encodes every op (or fused group) into its own command buffer and waits for it,
++// then prints its GPU time to stderr: "opprof\t<graph>\t<op+op..>\t<first node name>\t<n nodes>\t<us>".
++// Ops run serially on an idle GPU, so the times add up to more than a normal run - for ranking ops, not for t/s.
++static enum ggml_status ggml_metal_graph_compute_op_profile(ggml_metal_t ctx, struct ggml_cgraph * gf) {
++    static int n_graph = 0;
++
++    if (ctx->cmd_buf_last) {
++        [ctx->cmd_buf_last waitUntilCompleted];
++        ctx->cmd_buf_last = nil;
++    }
++
++    id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
++
++    for (int start = 0; start < gf->n_nodes; ) {
++        @autoreleasepool {
++            id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
++
++            ggml_metal_op_t ctx_op = ggml_metal_op_init(ctx->dev, cmd_buf, gf, ctx->finfo, start, gf->n_nodes, false, false, 0);
++            const int res = ggml_metal_op_n_nodes(ctx_op) > 0 ? ggml_metal_op_encode(ctx_op, 0) : 0;
++
++            char ops[256] = "";
++            for (int k = 0; k < res; ++k) {
++                const size_t len = strlen(ops);
++                snprintf(ops + len, sizeof(ops) - len, "%s%s", k ? "+" : "", ggml_op_desc(gf->nodes[ggml_metal_op_node_idx(ctx_op, k)]));
++            }
++            const char * name = res > 0 ? gf->nodes[ggml_metal_op_node_idx(ctx_op, 0)]->name : "";
++            const int next = ggml_metal_op_node_idx(ctx_op, res);
++
++            ggml_metal_op_free(ctx_op);
++
++            if (res <= 0) {
++                break;
++            }
++
++            [cmd_buf commit];
++            [cmd_buf waitUntilCompleted];
++
++            if ([cmd_buf status] != MTLCommandBufferStatusCompleted) {
++                ctx->has_error = true;
++                return GGML_STATUS_FAILED;
++            }
++
++            fprintf(stderr, "opprof\t%d\t%s\t%s\t%d\t%.2f\n", n_graph, ops, name, res, ([cmd_buf GPUEndTime] - [cmd_buf GPUStartTime])*1e6);
++
++            start = next;
++        }
++    }
++
++    n_graph++;
++
++    return GGML_STATUS_SUCCESS;
++}
++
+ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+     if (ctx->has_error) {
+         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
+@@ -490,6 +546,10 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+     // keep the memory wired
+     ggml_metal_device_rsets_keep_alive(ctx->dev);
+ 
++    if (ctx->op_profile) {
++        return ggml_metal_graph_compute_op_profile(ctx, gf);
++    }
++
+     // submit the ggml compute graph to the GPU by creating command buffers and encoding the ops in them
+     // the first n_nodes_0 are encoded and submitted for processing directly by the calling thread
+     // while these nodes are processing, we start n_cb threads to enqueue the rest of the nodes
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 597d530..ab21a50 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -76,6 +76,10 @@ struct ggml_metal_op {
+         return idxs.size();
+     }
+ 
++    int node_idx(int i) const {
++        return i < n_nodes() ? idxs[i] : idx_end;
++    }
++
+     ggml_tensor * node(int i) const {
+         assert(i >= 0 && i < (int) idxs.size());
+         return ggml_graph_node(gf, idxs[i]);
+@@ -156,6 +160,10 @@ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
+     return ctx->n_nodes();
+ }
+ 
++int ggml_metal_op_node_idx(ggml_metal_op_t ctx, int i) {
++    return ctx->node_idx(i);
++}
++
+ static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
+     if (!ctx->mem_ranges) {
+         return true;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.h b/ggml/src/ggml-metal/ggml-metal-ops.h
+index 583d115..07eb8df 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.h
++++ b/ggml/src/ggml-metal/ggml-metal-ops.h
+@@ -25,6 +25,9 @@ void ggml_metal_op_free(ggml_metal_op_t ctx);
+ 
+ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
+ 
++// graph index of the i-th non-empty node of the range, idx_end for i == n_nodes (byteplan op profiler)
++int ggml_metal_op_node_idx(ggml_metal_op_t ctx, int i);
++
+ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
+ 
+ //
+-- 
+2.53.0
+

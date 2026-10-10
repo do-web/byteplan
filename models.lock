@@ -1,0 +1,26 @@
+# repo	revision	path	sha256	size	dest  (sha256 = HF LFS oid at revision; '-' = small non-LFS file, git-tracked by revision)
+Lynxpda/micro-qwen4exp	c24f66cdfe20713c3a0fa6c98ba89e8fb13a1be4	micro-qwen4exp-realqsa.gguf	b5ea5c6df7b079095bd1d375d477f476a1913df9c87412ed7e9800a8cc3909d7	416452160	micro
+Lynxpda/micro-qwen4exp	c24f66cdfe20713c3a0fa6c98ba89e8fb13a1be4	micro-qwen4exp-realqsa-mtp.gguf	4b4373fb211fce86a6c4bd0ea02a6e46762512cd4470177f497b4e32baaed924	148810048	micro
+Lynxpda/micro-qwen4exp	c24f66cdfe20713c3a0fa6c98ba89e8fb13a1be4	micro-qwen4exp-realqsa-Q4_K_M.gguf	40e3bd490e347bec096f080bf41550d4ca873fb205557ab4624ebb5af6fcaa37	140789344	micro
+Lynxpda/micro-qwen4exp	c24f66cdfe20713c3a0fa6c98ba89e8fb13a1be4	micro-qwen4exp-realqsa-mtp-Q4_K_M.gguf	df4a78cd4ed9333a52d7ec7bdc97aef6cf1f678d5a21adf4f37bbb602b6eb155	51138144	micro
+Lynxpda/micro-qwen4exp	c24f66cdfe20713c3a0fa6c98ba89e8fb13a1be4	mk_micro_gguf.c	-	22026	micro
+Lynxpda/micro-qwen4exp	c24f66cdfe20713c3a0fa6c98ba89e8fb13a1be4	README.md	-	8330	micro
+Qwen/Qwen3.8-Flash-Next	de4b8e4d43b917e7706784d8bb445c9af86a3540	LICENSE	-	3235	qwen-meta
+Qwen/Qwen3.8-Flash-Next	de4b8e4d43b917e7706784d8bb445c9af86a3540	README.md	-	65155	qwen-meta
+Qwen/Qwen3.8-Flash-Next	de4b8e4d43b917e7706784d8bb445c9af86a3540	config.json	-	4745	qwen-meta
+Qwen/Qwen3.8-Flash-Next	de4b8e4d43b917e7706784d8bb445c9af86a3540	generation_config.json	-	202	qwen-meta
+Qwen/Qwen3.8-Flash-Next	de4b8e4d43b917e7706784d8bb445c9af86a3540	tokenizer.json	0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3	12809320	qwen-meta
+Qwen/Qwen3.8-Flash-Next	de4b8e4d43b917e7706784d8bb445c9af86a3540	tokenizer_config.json	-	17928	qwen-meta
+Qwen/Qwen3.8-Flash-Next	de4b8e4d43b917e7706784d8bb445c9af86a3540	chat_template.jinja	-	8952	qwen-meta
+Cudecnik/Qwen3.8-Flash-Next-refusal-projection	1886570b24da230aa04c67e657b78caa72be8b5b	Qwen3.8-Flash-Next-refusal-projection.gguf	ef0724c5b79297e481017be85769832bc26eb220c984ecba2b0e1b0c8426312b	483520	cudecnik
+Cudecnik/Qwen3.8-Flash-Next-refusal-projection	1886570b24da230aa04c67e657b78caa72be8b5b	Qwen3.8-Flash-Next-refusal-projection.json	-	785	cudecnik
+Cudecnik/Qwen3.8-Flash-Next-refusal-projection	1886570b24da230aa04c67e657b78caa72be8b5b	README.md	-	20192	cudecnik
+Cudecnik/Qwen3.8-Flash-Next-refusal-projection	1886570b24da230aa04c67e657b78caa72be8b5b	01-qwen4exp-cvec-hooks.patch	-	2850	cudecnik
+Cudecnik/Qwen3.8-Flash-Next-refusal-projection	1886570b24da230aa04c67e657b78caa72be8b5b	02-cvec-projection-mode.patch	-	22674	cudecnik
+ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF	ed59f92082b1e93c0e96d60a8b11aab089b52f09	README.md	-	15693	ista
+ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF	ed59f92082b1e93c0e96d60a8b11aab089b52f09	tensor-allocation/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.rco-allocation.txt	-	39062	ista
+ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF	ed59f92082b1e93c0e96d60a8b11aab089b52f09	Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf	69820c02ec7d0b45ef2ebb19d6620299db749fe2aded7f39f93c6b88b199b720	37623740192	ista
+ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF	ed59f92082b1e93c0e96d60a8b11aab089b52f09	Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf	316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113	28800138432	ista
+Joakimpalm-Zen/Qwen3.8-Flash-Next-MTP-GGUF	efb164c2ef115bad23ea654c0c681ba34a4a1e74	Qwen3.8-Flash-Next-MTP-Q8_0.gguf	cd2f837a63f0b6ea1d951976e161fc40648932ffaf59194aed3557175638000b	4165605056	mtp
+Joakimpalm-Zen/Qwen3.8-Flash-Next-MTP-GGUF	efb164c2ef115bad23ea654c0c681ba34a4a1e74	README.md	-	6484	mtp
+ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF	ed59f92082b1e93c0e96d60a8b11aab089b52f09	mmproj-Qwen3.8-Flash-Next-BF16.gguf	b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0	907543008	ista

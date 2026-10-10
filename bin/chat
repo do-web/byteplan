@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Byteplan chat: web UI and OpenAI/Anthropic-compatible API on http://127.0.0.1:8080. Stop with Ctrl-C.
+#
+#   bin/chat [--long | --max | --ctx N] [--spar S] [--uncensored] [more llama-server options, e.g. --agent]
+#
+#   context:  64k (default) | --long 96k | --max 256k (needs --spar on 64 GB) | --ctx N
+#   --spar S  keep only S of the 512 experts per layer in memory (same answers, a bit slower):
+#             410 saves ~6.6 GB, 358 ~10 GB, 256 ~16 GB. Needs ./install.sh --spar once.
+#   --uncensored  load the refusal-removal projection (needs ./install.sh --uncensored once). See docs/UNCENSORED.md.
+#   --agent   (llama-server option) lets the model read/write files and run shell commands. Only on your own machine.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+D="${BYTEPLAN_MODELS:-$HOME/byteplan-models}"
+SERVER="$ROOT/build/bin/llama-server"
+O1="$D/ista-o1/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-dense-q8_0-router-q8_0-00001-of-00002.gguf"
+SP="$D/ista-o1-spar/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-dense-q8_0-router-q8_0-spar"
+PROJ="$D/cudecnik/Qwen3.8-Flash-Next-refusal-projection.gguf"
+
+die() { echo "bin/chat: $*" >&2; exit 2; }
+CTX=65536 SPAR="" UNCENSORED=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) sed -n '2,10p' "$0" | cut -c3-; exit 0 ;;
+    --long) CTX=98304; shift ;;
+    --max) CTX=262144; shift ;;
+    --ctx)
+      CTX="${2:-}"; shift 2 || true
+      [[ "$CTX" =~ ^[0-9]+$ ]] && [ "$CTX" -ge 4096 ] && [ "$CTX" -le 262144 ] || die "--ctx needs 4096..262144" ;;
+    --spar)
+      SPAR="${2:-}"; shift 2 || true
+      [[ "$SPAR" =~ ^[0-9]+$ ]] && [ "$SPAR" -ge 10 ] && [ "$SPAR" -le 512 ] || die "--spar needs 10..512" ;;
+    --uncensored) UNCENSORED=1; shift ;;
+    *) break ;;
+  esac
+done
+
+[ -x "$SERVER" ] || die "not installed yet: run ./install.sh"
+[ -f "$O1" ] || [ -n "$SPAR" ] || die "model missing in $D: run ./install.sh"
+
+# Memory: the model needs ~44 GB with 64k context; bigger contexts ~46 KB per token more
+NEED_GB=44
+# MTP drafts + n-gram drafts (8 to 15 tokens, patch 0015) from the context: exact verification, code edits ~2x faster
+# the 2-bit vocabulary head from install.sh makes each draft step read 199 instead of 497 MiB
+MTP="$D/mtp/Qwen3.8-Flash-Next-MTP-Q4_K_M"
+[ -f "$MTP-head2.gguf" ] && MTP="$MTP-head2"
+# shellcheck disable=SC2054  # comma list is one llama-server value
+SPEC=(-md "$MTP.gguf" --spec-type draft-mtp,ngram-mod --spec-draft-n-max 3)
+# the vision encoder and the token embedding stay in normal (swappable) memory; images run on a GPU copy loaded on demand
+VISION=(--mmproj "$D/ista/mmproj-Qwen3.8-Flash-Next-BF16.gguf" --no-mmproj-offload -ot '^token_embd\.weight$=CPU')
+# prompts are read in chunks of 2048 tokens up to 64k context (+3 % over 1024 for ~1 GB, same results: the kernels
+# compute each token alike in any chunk of 32+), 1024 up to 128k, 512 above: the memory goes to the context
+UB=2048 UB_GB=2
+if [ "$CTX" -gt 65536 ]; then UB=1024 UB_GB=1; fi
+if [ "$CTX" -gt 131072 ]; then UB=512 UB_GB=0; fi
+MODEL=(-m "$O1" -ub "$UB" -b "$UB")
+if [ -n "$SPAR" ]; then
+  [ -f "$SP.experts.bin" ] || die "expert pool files missing: run ./install.sh --spar"
+  # with the pool, larger prompt batches also mean fewer expert sweeps (+17 % at 2048)
+  if [ "$UB" = 1024 ]; then UB=2048 UB_GB=2; fi
+  MODEL=(-m "$SP-00001-of-00002.gguf" --spar-experts "$SP.experts.bin" --spar-slots "$SPAR" -ub "$UB" -b "$UB")
+  # one expert slot = 1392640 bytes in each of 48 layers
+  NEED_GB=$(( NEED_GB - (512 - SPAR) * 48 * 1392640 / 1073741824 ))
+fi
+NEED_GB=$(( NEED_GB + UB_GB ))
+if [ "$CTX" -gt 65536 ]; then NEED_GB=$(( NEED_GB + (CTX - 65536) * 46 / 1048576 )); fi
+
+# the start of each new chat (system prompt + tools) is also kept on the SSD, so agents start at once after a restart
+ENV=(GGML_METAL_N_CB=8 BYTEPLAN_MMPROJ_LAZY_GPU=1 BYTEPLAN_PROMPT_DISK="$D/prompt-cache")
+if [ "$UNCENSORED" = 1 ]; then
+  [ -f "$PROJ" ] || die "projection file missing: run ./install.sh --uncensored"
+  ENV+=(BYTEPLAN_REFUSAL_PROJ="$PROJ")
+fi
+
+echo "Byteplan: $((CTX / 1024))k context${SPAR:+, expert pool $SPAR/512}$([ "$UNCENSORED" = 1 ] && echo ", uncensored")" >&2
+echo "          open http://127.0.0.1:8080 (needs ~$NEED_GB GB free memory)" >&2
+exec "$ROOT/bin/run-guarded" --profile parallel --need-gb "$NEED_GB" -- env "${ENV[@]}" "$SERVER" \
+  "${MODEL[@]}" -lm mmap -lzm on "${VISION[@]}" "${SPEC[@]}" --chat-template-file "$D/qwen-meta/chat_template.jinja" \
+  -c "$CTX" -np 1 --cache-ram 0 --ctx-checkpoints 8 --checkpoint-min-step 1024 --host 127.0.0.1 --port 8080 "$@"

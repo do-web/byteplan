@@ -1,0 +1,370 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sat, 10 Oct 2026 15:18:31 +0200
+Subject: [PATCH 14/27] byteplan: keep the start of new chats on the SSD
+ (BYTEPLAN_PROMPT_DISK)
+
+The state at the first user message (system prompt + tool definitions) of the main and the MTP
+context is written to files once, together with the protected checkpoint of patch 0011. After a
+server restart, a new chat or agent session with the same start loads it (0.1 s) instead of
+reading it again (33 s for 13.6k tokens). Entries are keyed by model files, build, batch and
+context sizes, KV types and Byteplan settings; BYTEPLAN_PROMPT_DISK_GB (default 8) caps the folder,
+least recently used first. The loaded state is the saved one bit for bit, and the prompt continues
+at the same batch boundary, so answers are unchanged.
+---
+ tools/server/server-context.cpp | 273 ++++++++++++++++++++++++++++++++
+ tools/server/server-models.cpp  |   2 +-
+ tools/server/server-models.h    |   5 +
+ 3 files changed, 279 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 20cc363..11f0b1a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3,6 +3,7 @@
+ #include "server-common.h"
+ #include "server-decision.h"
+ #include "server-http.h"
++#include "server-models.h"
+ #include "server-task.h"
+ #include "server-queue.h"
+ #include "server-schema.h"
+@@ -134,6 +135,254 @@ enum slot_state {
+ 
+ struct server_slot; // forward declaration
+ 
++#ifndef _WIN32
++extern char ** environ;
++#endif
++
++// byteplan: SSD tier for the shared start of every new chat (system prompt + tool definitions, up to the first user
++// message). The full state of the main and the MTP context at that point is written to files once, so a new chat with
++// the same start skips it also after a server restart. On with BYTEPLAN_PROMPT_DISK=<dir>; BYTEPLAN_PROMPT_DISK_GB
++// (default 8, 0 = off) caps the folder, least recently used first. Entries are keyed by everything that changes the
++// computed state: model files, server executable, build, context and batch sizes, KV types, adapters, RoPE settings
++// and all GGML_/LLAMA_/BYTEPLAN_ environment variables. Saving hangs on the context checkpoint at the first user
++// message, so it works for models with checkpoints (recurrent or SWA layers, --ctx-checkpoints > 0).
++// Files per entry: <key>-<hash>.tgt and .dft (llama_state_seq_save_file), then .ckpt with the tokens (written last).
++struct bp_prompt_disk {
++    struct entry {
++        std::string  base;
++        llama_tokens tokens;
++    };
++
++    std::string        dir;
++    uint64_t           key   = 0;
++    uint64_t           limit = 8ull << 30;
++    std::vector<entry> index; // entries of this key, least recently used first
++
++    static constexpr uint32_t magic = 0x32505042; // "BPP2"
++    static constexpr int32_t  n_min = 512;        // shorter starts are cheap to recompute
++
++    static uint64_t fnv(const void * p, size_t n, uint64_t h = 1469598103934665603ull) {
++        const auto * b = (const uint8_t *) p;
++        for (size_t i = 0; i < n; ++i) {
++            h ^= b[i];
++            h *= 1099511628211ull;
++        }
++        return h;
++    }
++
++    bool enabled() const { return !dir.empty(); }
++
++    void init(const common_params & params, llama_context * ctx) {
++        const char * d = getenv("BYTEPLAN_PROMPT_DISK");
++        if (!d || !*d) {
++            return;
++        }
++        if (const char * gb = getenv("BYTEPLAN_PROMPT_DISK_GB")) {
++            limit = (uint64_t) (std::max(0.0, atof(gb)) * 1073741824.0);
++            if (limit == 0) {
++                return;
++            }
++        }
++        std::error_code ec;
++        std::filesystem::create_directories(d, ec);
++        if (ec) {
++            SRV_WRN("prompt disk cache off: cannot create %s\n", d);
++            return;
++        }
++
++        std::string k = llama_build_info();
++        auto add_file = [&](const std::string & path) {
++            k += "|" + path;
++            if (!path.empty() && std::filesystem::exists(path, ec)) {
++                k += ":" + std::to_string((unsigned long long) std::filesystem::file_size(path, ec));
++                k += ":" + std::to_string((long long) std::filesystem::last_write_time(path, ec).time_since_epoch().count());
++            }
++        };
++        add_file(params.model.path);
++        add_file(params.speculative.draft.mparams.path);
++        try {
++            add_file(fs_path_to_utf8(get_server_exec_path())); // a rebuild with other kernels is another key
++        } catch (const std::exception &) {
++        }
++        for (const auto & la : params.lora_adapters) {
++            add_file(la.path);
++            k += ":" + std::to_string(la.scale);
++        }
++        k += "|cvec:" + std::to_string(params.control_vectors.size()) + "|kvo:" + std::to_string(params.kv_overrides.size());
++        k += "|" + std::to_string(llama_n_batch(ctx)) + "|" + std::to_string(llama_n_ubatch(ctx)) + "|" + std::to_string(llama_n_ctx(ctx));
++        k += "|" + std::to_string((int) params.cache_type_k) + "|" + std::to_string((int) params.cache_type_v);
++        k += "|" + std::to_string((int) params.flash_attn_type) + "|" + std::to_string(params.swa_full);
++        k += "|" + std::to_string(params.rope_freq_base) + "|" + std::to_string(params.rope_freq_scale) + "|" + std::to_string(params.yarn_ext_factor);
++        std::vector<std::string> env;
++        for (char ** e = environ; e && *e; ++e) {
++            const std::string v = *e;
++            if ((v.rfind("GGML_", 0) == 0 || v.rfind("LLAMA_", 0) == 0 || v.rfind("BYTEPLAN_", 0) == 0) &&
++                v.rfind("BYTEPLAN_PROMPT_DISK", 0) != 0) {
++                env.push_back(v);
++            }
++        }
++        std::sort(env.begin(), env.end());
++        for (const auto & v : env) {
++            k += "|" + v;
++        }
++        key = fnv(k.data(), k.size());
++        dir = d;
++        scan();
++        SRV_INF("prompt disk cache: %s, %zu entries (limit %.1f GiB)\n", dir.c_str(), index.size(), limit / 1073741824.0);
++    }
++
++    // one pass over the folder: index this key's entries, delete leftovers of interrupted saves, apply the size limit
++    void scan() {
++        std::error_code ec;
++        char prefix[24];
++        snprintf(prefix, sizeof(prefix), "%016" PRIx64 "-", key);
++        struct stat_t { uint64_t bytes = 0; bool done = false; std::filesystem::file_time_type t; };
++        std::map<std::string, stat_t> bases;
++        for (const auto & e : std::filesystem::directory_iterator(dir, ec)) {
++            const std::string path = e.path().string();
++            const size_t dot = path.find('.', path.rfind('/') + 1);
++            auto & st = bases[path.substr(0, dot)];
++            st.bytes += e.file_size(ec);
++            if (e.path().extension() == ".ckpt") {
++                st.done = true;
++                st.t    = e.last_write_time(ec);
++            }
++        }
++        std::vector<std::pair<std::filesystem::file_time_type, std::string>> order;
++        for (const auto & [b, st] : bases) {
++            if (!st.done) {
++                drop(b); // .tgt/.dft without .ckpt: a save that did not finish
++                continue;
++            }
++            order.emplace_back(st.t, b);
++        }
++        std::sort(order.begin(), order.end());
++        uint64_t total = 0;
++        for (const auto & [t, b] : order) {
++            total += bases[b].bytes;
++        }
++        index.clear();
++        for (const auto & [t, b] : order) {
++            if (total > limit) {
++                total -= bases[b].bytes;
++                drop(b);
++                continue;
++            }
++            if (b.compare(b.rfind('/') + 1, strlen(prefix), prefix) != 0) {
++                continue; // another key: counts for the limit, never loaded
++            }
++            std::ifstream f(b + ".ckpt", std::ios::binary);
++            uint32_t m = 0, n_tok = 0;
++            f.read((char *) &m, 4); f.read((char *) &n_tok, 4);
++            llama_tokens toks(f && m == magic ? n_tok : 0);
++            f.read((char *) toks.data(), toks.size() * sizeof(llama_token));
++            if (!f || toks.empty()) {
++                drop(b);
++                continue;
++            }
++            index.push_back({ b, std::move(toks) });
++        }
++    }
++
++    static void drop(const std::string & b) {
++        std::error_code ec;
++        for (const char * ext : { ".tgt", ".dft", ".ckpt", ".ckpt.part" }) {
++            std::filesystem::remove(b + ext, ec);
++        }
++    }
++
++    void touch(size_t i) {
++        std::error_code ec;
++        std::filesystem::last_write_time(index[i].base + ".ckpt", std::filesystem::file_time_type::clock::now(), ec);
++        std::rotate(index.begin() + i, index.begin() + i + 1, index.end());
++    }
++
++    void save(llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq, llama_tokens tokens) {
++        for (size_t i = 0; i < index.size(); ++i) {
++            if (index[i].tokens == tokens) {
++                touch(i);
++                return;
++            }
++        }
++        char name[64];
++        snprintf(name, sizeof(name), "/%016" PRIx64 "-%016" PRIx64, key, fnv(tokens.data(), tokens.size() * sizeof(llama_token)));
++        const std::string b = dir + name;
++        const int64_t t0 = ggml_time_us();
++        bool ok = llama_state_seq_save_file(ctx_tgt, (b + ".tgt").c_str(), seq, tokens.data(), tokens.size()) != 0 &&
++                  (!ctx_dft || llama_state_seq_save_file(ctx_dft, (b + ".dft").c_str(), seq, tokens.data(), tokens.size()) != 0);
++        if (ok) {
++            std::ofstream f(b + ".ckpt.part", std::ios::binary);
++            const uint32_t m = magic, n_tok = tokens.size();
++            f.write((const char *) &m, 4);
++            f.write((const char *) &n_tok, 4);
++            f.write((const char *) tokens.data(), n_tok * sizeof(llama_token));
++            ok = (bool) f;
++        }
++        std::error_code ec;
++        if (ok) {
++            std::filesystem::rename(b + ".ckpt.part", b + ".ckpt", ec);
++            ok = !ec;
++        }
++        if (!ok) {
++            SRV_WRN("prompt disk cache: failed to write %s\n", b.c_str());
++            drop(b);
++            return;
++        }
++        SRV_INF("prompt disk cache: saved the start of %zu tokens in %.2f s\n", tokens.size(), (ggml_time_us() - t0) / 1e6);
++        index.push_back({ b, std::move(tokens) });
++        scan(); // size limit
++    }
++
++    // the longest stored start that tokens_new begins with and that is longer than n_keep (what the slot already has)
++    int find(const server_tokens & tokens_new, int32_t n_keep) const {
++        int best = -1;
++        for (int i = 0; i < (int) index.size(); ++i) {
++            const auto & t = index[i].tokens;
++            if ((int32_t) t.size() <= n_keep || t.size() >= tokens_new.size() || (best >= 0 && t.size() <= index[best].tokens.size())) {
++                continue;
++            }
++            size_t j = 0; // server_tokens::get_tokens() is not allowed with a multimodal context, media positions are NULL
++            while (j < t.size() && tokens_new[j] == t[j]) {
++                ++j;
++            }
++            if (j == t.size()) {
++                best = i;
++            }
++        }
++        return best;
++    }
++
++    // loads entry i into the slot: the prompt tokens and the context checkpoint at that point are set (the checkpoint
++    // is taken again from the loaded state, which is what it held when the entry was saved)
++    bool load(int i, llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq, server_prompt & prompt, bool has_mtmd) {
++        const int64_t t0 = ggml_time_us();
++        const entry & e = index[i];
++        llama_tokens tmp(e.tokens.size());
++        size_t n_read = 0;
++        if (llama_state_seq_load_file(ctx_tgt, (e.base + ".tgt").c_str(), seq, tmp.data(), tmp.size(), &n_read) == 0 || tmp != e.tokens ||
++            (ctx_dft && llama_state_seq_load_file(ctx_dft, (e.base + ".dft").c_str(), seq, tmp.data(), tmp.size(), &n_read) == 0)) {
++            SRV_WRN("prompt disk cache: cannot load %s, dropping it\n", e.base.c_str());
++            llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq, -1, -1);
++            if (ctx_dft) {
++                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq, -1, -1);
++            }
++            prompt.clear();
++            drop(e.base);
++            index.erase(index.begin() + i);
++            return false;
++        }
++        prompt.clear();
++        prompt.tokens = server_tokens(e.tokens, has_mtmd);
++        auto & cp = prompt.checkpoints.emplace_back();
++        cp.update_pos(e.tokens.size(), llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), seq), llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), seq));
++        cp.update_tgt(ctx_tgt, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        cp.update_dft(ctx_dft, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        SRV_INF("prompt disk cache: loaded the start of %zu tokens in %.2f s\n", e.tokens.size(), (ggml_time_us() - t0) / 1e6);
++        touch(i);
++        return true;
++    }
++};
++
+ struct server_batch {
+     common_batch view; // the rendered sub-batch [off, off + n_tokens), see render()
+ 
+@@ -1065,6 +1314,7 @@ private:
+     int n_empty_consecutive = 0;
+ 
+     std::unique_ptr<server_prompt_cache> prompt_cache;
++    bp_prompt_disk prompt_disk; // byteplan: SSD tier for the start of new chats
+ 
+     server_metrics metrics;
+ 
+@@ -1565,6 +1815,7 @@ private:
+             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+         }
+         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
++        prompt_disk.init(params_base, ctx_tgt);
+ 
+         if (params_base.n_ctx_checkpoints > 0) {
+             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
+@@ -1858,6 +2109,17 @@ private:
+ 
+                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+             }
++
++            // byteplan: a longer stored start from the SSD; the slot's current state goes to the RAM tier first
++            if (prompt_disk.enabled() && task.type == SERVER_TASK_TYPE_COMPLETION) {
++                const int i = prompt_disk.find(task.tokens, ret->prompt.tokens.get_common_prefix(task.tokens));
++                if (i >= 0) {
++                    if (prompt_cache) {
++                        ret->prompt_save(*prompt_cache);
++                    }
++                    prompt_disk.load(i, ret->ctx_tgt, ret->ctx_dft, ret->id, ret->prompt, task.tokens.has_mtmd);
++                }
++            }
+         }
+ 
+         return ret;
+@@ -2651,6 +2913,17 @@ private:
+         // stash the draft's speculative state with the checkpoint
+         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+ 
++        // byteplan: the start of a new chat also goes to the SSD (text only, long enough to be worth it)
++        if (prompt_disk.enabled() && cur.n_tokens == keep && keep >= bp_prompt_disk::n_min) {
++            llama_tokens start(keep);
++            for (int64_t i = 0; i < keep; ++i) {
++                start[i] = slot.prompt.tokens[i]; // NULL at media positions
++            }
++            if (std::find(start.begin(), start.end(), LLAMA_TOKEN_NULL) == start.end()) {
++                prompt_disk.save(ctx_tgt, ctx_dft, slot.id, std::move(start));
++            }
++        }
++
+         SLT_TRC(slot,
+                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+diff --git a/tools/server/server-models.cpp b/tools/server/server-models.cpp
+index 35d21c8..7c7745b 100644
+--- a/tools/server/server-models.cpp
++++ b/tools/server/server-models.cpp
+@@ -435,7 +435,7 @@ struct server_lru_sched {
+ // delete). distinct from params.timeout_read/write which only applies to the generation proxy
+ static constexpr int STREAM_LOOKUP_TIMEOUT_MS = 250;
+ 
+-static std::filesystem::path get_server_exec_path() {
++std::filesystem::path get_server_exec_path() {
+ #if defined(_WIN32)
+     wchar_t buf[32768] = { 0 };  // Large buffer to handle long paths
+     DWORD len = GetModuleFileNameW(nullptr, buf, _countof(buf));
+diff --git a/tools/server/server-models.h b/tools/server/server-models.h
+index 238955e..405f6f4 100644
+--- a/tools/server/server-models.h
++++ b/tools/server/server-models.h
+@@ -17,6 +17,11 @@
+ #include <string>
+ #include <unordered_map>
+ 
++#include <filesystem>
++
++// path of the running server executable
++std::filesystem::path get_server_exec_path();
++
+ /**
+  * state diagram:
+  *
+-- 
+2.53.0
+

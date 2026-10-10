@@ -1,0 +1,152 @@
+{
+ "Byteplan": [
+  {
+   "load_s": 3.584837834001519,
+   "decode": {
+    "code-edit": 176.05352093441596,
+    "agent-refactor": 117.8491913074244,
+    "code-new": 85.71814085118324,
+    "prose": 60.59514680641581
+   },
+   "hash": {
+    "code-edit": "110ea42a",
+    "agent-refactor": "043884bf",
+    "code-new": "3fd05bb5",
+    "prose": "15f62653"
+   },
+   "tokens": {
+    "code-edit": 900,
+    "agent-refactor": 900,
+    "code-new": 900,
+    "prose": 619
+   },
+   "prefill": 478.79219226358185,
+   "prefill_tokens": 6971,
+   "ttft_s": 0.2159595410048496
+  },
+  {
+   "load_s": 16.81927900001756,
+   "decode": {
+    "code-edit": 159.77013596522937,
+    "agent-refactor": 108.12556288886898,
+    "code-new": 79.07146353997337,
+    "prose": 56.88752036651282
+   },
+   "hash": {
+    "code-edit": "110ea42a",
+    "agent-refactor": "043884bf",
+    "code-new": "3fd05bb5",
+    "prose": "15f62653"
+   },
+   "tokens": {
+    "code-edit": 900,
+    "agent-refactor": 900,
+    "code-new": 900,
+    "prose": 619
+   },
+   "prefill": 451.9672020678718,
+   "prefill_tokens": 6971,
+   "ttft_s": 0.22131724999053404
+  }
+ ],
+ "sushi 2bpw (default)": [
+  {
+   "load_s": 16.800831542001106,
+   "decode": {
+    "code-edit": 115.39271420155335,
+    "agent-refactor": 109.47599858200033,
+    "code-new": 80.18902840628239,
+    "prose": 57.6135507895046
+   },
+   "hash": {
+    "code-edit": "110ea42a",
+    "agent-refactor": "0814203b",
+    "code-new": "908ebb89",
+    "prose": "53e686aa"
+   },
+   "tokens": {
+    "code-edit": 900,
+    "agent-refactor": 900,
+    "code-new": 389,
+    "prose": 588
+   },
+   "prefill": 614.2837336338675,
+   "prefill_tokens": 6971,
+   "ttft_s": 2.5691118749964517
+  },
+  {
+   "load_s": 9.148919667000882,
+   "decode": {
+    "code-edit": 99.07778584301445,
+    "agent-refactor": 96.21713434901704,
+    "code-new": 76.57780058568869,
+    "prose": 54.30532232755303
+   },
+   "hash": {
+    "code-edit": "110ea42a",
+    "agent-refactor": "0814203b",
+    "code-new": "908ebb89",
+    "prose": "53e686aa"
+   },
+   "tokens": {
+    "code-edit": 900,
+    "agent-refactor": 900,
+    "code-new": 389,
+    "prose": 588
+   },
+   "prefill": 597.1492015230556,
+   "prefill_tokens": 6971,
+   "ttft_s": 2.59966183299548
+  }
+ ],
+ "sushi 2bpw (lossless)": [
+  {
+   "load_s": 8.628396707994398,
+   "decode": {
+    "code-edit": 113.62211215599328,
+    "agent-refactor": 109.07747764161157,
+    "code-new": 83.60423381977886,
+    "prose": 50.778633384164515
+   },
+   "hash": {
+    "code-edit": "110ea42a",
+    "agent-refactor": "0814203b",
+    "code-new": "79d3a936",
+    "prose": "16dcc125"
+   },
+   "tokens": {
+    "code-edit": 900,
+    "agent-refactor": 900,
+    "code-new": 389,
+    "prose": 563
+   },
+   "prefill": 643.3973966840827,
+   "prefill_tokens": 6971,
+   "ttft_s": 2.5858655000047293
+  },
+  {
+   "load_s": 9.157716292014811,
+   "decode": {
+    "code-edit": 104.03139645155844,
+    "agent-refactor": 98.03654509960259,
+    "code-new": 77.5688942216293,
+    "prose": 54.43531570682693
+   },
+   "hash": {
+    "code-edit": "110ea42a",
+    "agent-refactor": "0814203b",
+    "code-new": "79d3a936",
+    "prose": "16dcc125"
+   },
+   "tokens": {
+    "code-edit": 900,
+    "agent-refactor": 900,
+    "code-new": 389,
+    "prose": 563
+   },
+   "prefill": 628.2467054785674,
+   "prefill_tokens": 6971,
+   "ttft_s": 2.8051770419988316
+  }
+ ]
+}

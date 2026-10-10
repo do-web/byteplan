@@ -1,0 +1,13 @@
+# built or downloaded by install.sh
+/vendor/
+/build/
+/install.log
+# local runs
+/logs/
+/bench/
+*.gguf
+*.experts.bin
+tools/compiler/.venv/
+tools/compiler/.build/
+__pycache__/
+.DS_Store

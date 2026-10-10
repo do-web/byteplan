@@ -1,0 +1,678 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sun, 11 Oct 2026 12:00:38 +0200
+Subject: [PATCH 21/27] byteplan: sparse prefill attention on simdgroup MMA,
+ narrow-row dispatch, 64-row matmul tiles
+
+kernel_flash_attn_ext_sparse: a large sparse batch (QSA prefill) runs all heads of a KV group per threadgroup over the
+query's index list, K/V fragments loaded straight from the gathered cache rows into the simdgroup matrices; 3x faster
+than one vec threadgroup per query and head. Rounding changes; KL against one-row decoding is unchanged (0.00213 vs
+0.00202 +- 0.00013, top-1 98.91 vs 98.90 %). BYTEPLAN_FA_SPARSE_MMA_OFF=1 keeps the vec path.
+Unary, get_rows and repeat put several narrow rows into one threadgroup instead of a threadgroup of 1-4 threads per
+row (same element math). Dense mul_mm takes 64 src1 rows per threadgroup for batches of 512+ rows, so every
+dequantized weight tile serves twice the rows (same MMA sequence per element).
+---
+ ggml/src/ggml-metal/ggml-metal-device.cpp  |  31 +++-
+ ggml/src/ggml-metal/ggml-metal-device.h    |   5 +
+ ggml/src/ggml-metal/ggml-metal-ops.cpp     |  81 ++++++++-
+ ggml/src/ggml-metal/kernels/binbcast.metal |   6 +-
+ ggml/src/ggml-metal/kernels/fa_f16.metal   | 194 +++++++++++++++++++++
+ ggml/src/ggml-metal/kernels/mul_mm.metal   |  46 +++--
+ ggml/src/ggml-metal/kernels/quantize.metal |  15 +-
+ ggml/src/ggml-metal/kernels/unary.metal    |  11 +-
+ tests/test-backend-ops.cpp                 |   5 +
+ 9 files changed, 363 insertions(+), 31 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 3ef6d72..944e9ca 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -951,9 +951,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
+ 
+     const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
+ 
++    // byteplan: 64 src1 rows per threadgroup for large batches (prefill), see FC_mul_mm_r64
++    const bool r64 = !has_tensor && op->src[1]->ne[1] >= 512;
++
+     const bool bc_out = has_tensor
+         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
+-        : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
++        : (op->ne[0] % 64  != 0 || op->ne[1] % (r64 ? 64 : 32) != 0);
+ 
+     GGML_ASSERT(op->src[1]->ne[2] <= INT16_MAX && op->src[1]->ne[3] <= INT16_MAX);
+     const int16_t ne12 = (int16_t) op->src[1]->ne[2];
+@@ -962,8 +965,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
+     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
+ 
+     snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+-    snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
+-             base, bc_inp, bc_out, ne12, ne13, r2, r3);
++    snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d_r64=%d",
++             base, bc_inp, bc_out, ne12, ne13, r2, r3, r64);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+@@ -975,6 +978,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
+         ggml_metal_cv_set_int16(cv, ne13,  FC_MUL_MM + 3);
+         ggml_metal_cv_set_int16(cv, r2,    FC_MUL_MM + 4);
+         ggml_metal_cv_set_int16(cv, r3,    FC_MUL_MM + 5);
++        ggml_metal_cv_set_bool (cv, r64,   FC_MUL_MM + 7);
+ 
+         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+ 
+@@ -989,9 +993,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
+         res.smem = smem_a;
+     } else {
+         res.nr0 = 64;
+-        res.nr1 = 32;
++        res.nr1 = r64 ? 64 : 32;
+ 
+-        res.smem = bc_out ? 8192 : (4096 + 2048);
++        res.smem = bc_out ? 64*res.nr1*sizeof(float) : (4096 + res.nr1*32*sizeof(ggml_fp16_t));
+     }
+ 
+     res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+@@ -1984,6 +1988,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_sparse(
++        ggml_metal_library_t lib,
++        const ggml_tensor * op) {
++    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
++
++    char name[256];
++
++    snprintf(name, 256, "kernel_flash_attn_ext_sparse_f16_dk%d_dv%d", (int) op->src[1]->ne[0], (int) op->src[2]->ne[0]);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec(
+         ggml_metal_library_t lib,
+         const ggml_tensor * op,
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 7293116..6ce37e0 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -222,6 +222,11 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
+         ggml_metal_library_t lib,
+         const struct ggml_tensor * op);
+ 
++// byteplan: sparse prefill attention on simdgroup MMA, all heads of a KV group per threadgroup
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_sparse(
++        ggml_metal_library_t lib,
++        const struct ggml_tensor * op);
++
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec(
+         ggml_metal_library_t lib,
+         const struct ggml_tensor * op,
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 2443c44..2332984 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -704,7 +704,10 @@ int ggml_metal_op_repeat(ggml_metal_op_t ctx, int idx) {
+ 
+     const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), ne0);
+ 
+-    ggml_metal_encoder_dispatch_threadgroups(enc, ne1, ne2, ne3, nth, 1, 1);
++    // byteplan: several narrow rows per threadgroup
++    const int nrptg = std::max(1, std::min(256/nth, ne1));
++
++    ggml_metal_encoder_dispatch_threadgroups(enc, (ne1 + nrptg - 1)/nrptg, ne2, ne3, nth, nrptg, 1);
+ 
+     return 1;
+ }
+@@ -943,7 +946,10 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
+         const int nth = MIN(args.ne00, nth_max);
+         const int nk0 = (args.ne00 + nth - 1)/nth;
+ 
+-        ggml_metal_encoder_dispatch_threadgroups(enc, nk0*ne01, ne02, ne03, nth, 1, 1);
++        // byteplan: several narrow rows per threadgroup instead of a threadgroup of a few threads per row
++        const int nrptg = MIN(nth_max/nth, ne01);
++
++        ggml_metal_encoder_dispatch_threadgroups(enc, nk0*((ne01 + nrptg - 1)/nrptg), ne02, ne03, nth, nrptg, 1);
+     }
+ 
+     return n_fuse;
+@@ -1286,13 +1292,16 @@ int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
+ 
+     const int nw0 = (args.ne00t + nth - 1)/nth;
+ 
++    // byteplan: several narrow rows per threadgroup (non-quantized rows)
++    const int nrptg = ggml_is_quantized(op->src[0]->type) ? 1 : std::max(1, std::min(256/nth, (int) ne10));
++
+     ggml_metal_encoder_set_pipeline(enc, pipeline);
+     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+ 
+-    ggml_metal_encoder_dispatch_threadgroups(enc, nw0*ne10, ne11, ne12, nth, 1, 1);
++    ggml_metal_encoder_dispatch_threadgroups(enc, nw0*((ne10 + nrptg - 1)/nrptg), ne11, ne12, nth, nrptg, 1);
+ 
+     return 1;
+ }
+@@ -4010,6 +4019,72 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+             ggml_metal_op_concurrency_reset(ctx);
+         }
+ 
++        // byteplan: a large sparse batch of f16 K/V runs on simdgroup MMA with all heads of a KV group per threadgroup
++        // (they share the index list of their query), instead of one vec threadgroup per query and head
++        static const bool sparse_mma_off = getenv("BYTEPLAN_FA_SPARSE_MMA_OFF") != nullptr;
++        if (use_sparse && !sparse_mma_off && ne01 > 32 &&
++                op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16 &&
++                !has_bias && !has_scap && !has_sinks && ne32 == 1 && ne02 % ne12 == 0 && ne02/ne12 <= 16 &&
++                ((ne00 == 128 && ne20 == 128) || (ne00 == 256 && ne20 == 256))) {
++            ggml_metal_kargs_flash_attn_ext_vec args = {
++                /*.ne01          =*/ ne01,
++                /*.ne02          =*/ ne02,
++                /*.ne03          =*/ ne03,
++                /*.nb01          =*/ nb01,
++                /*.nb02          =*/ nb02,
++                /*.nb03          =*/ nb03,
++                /*.ne11          =*/ n_kv_max_padded,
++                /*.ne_12_2       =*/ ne12,
++                /*.ne_12_3       =*/ ne13,
++                /*.ns10          =*/ (int32_t) (nb11_attn/nb10_attn),
++                /*.nb11          =*/ nb11_attn,
++                /*.nb12          =*/ nb12_attn,
++                /*.nb13          =*/ nb13_attn,
++                /*.ns20          =*/ (int32_t) (nb21_attn/nb20_attn),
++                /*.nb21          =*/ nb21_attn,
++                /*.nb22          =*/ nb22_attn,
++                /*.nb23          =*/ nb23_attn,
++                /*.ne31          =*/ ne31,
++                /*.ne32          =*/ ne32,
++                /*.ne33          =*/ ne33,
++                /*.nb31          =*/ nb31,
++                /*.nb32          =*/ nb32,
++                /*.nb33          =*/ nb33,
++                /*.ne1           =*/ ne1,
++                /*.ne2           =*/ ne2,
++                /*.ne3           =*/ ne3,
++                /*.scale         =*/ scale,
++                /*.max_bias      =*/ max_bias,
++                /*.m0            =*/ m0,
++                /*.m1            =*/ m1,
++                /*.n_head_log2   =*/ n_head_log2,
++                /*.logit_softcap =*/ logit_softcap,
++                /*.n_kv_max_padded =*/ n_kv_max_padded,
++            };
++
++            auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_sparse(lib, op);
++
++            // R = 16 query rows of DK halfs, 2 x R x C scores (C = 32), R row scales, C mask values (see the kernel)
++            const size_t smem = GGML_PAD(16*ne00*sizeof(ggml_fp16_t) + (2*16*32 + 16)*sizeof(float) + 32*sizeof(ggml_fp16_t), 16);
++
++            GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
++
++            ggml_metal_encoder_set_pipeline(enc, pipeline);
++            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++            ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
++            ggml_metal_encoder_set_buffer  (enc, bid_k,    2);
++            ggml_metal_encoder_set_buffer  (enc, bid_v,    3);
++            ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
++            ggml_metal_encoder_set_buffer  (enc, bid_idx,  5);
++            ggml_metal_encoder_set_buffer  (enc, bid_dst,  6);
++
++            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
++
++            ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne12, ne03, 32, 4, 1);
++
++            return 1;
++        }
++
+         // note: for simplicity assume the K is larger or equal than V
+         GGML_ASSERT(ne10 >= ne20);
+ 
+diff --git a/ggml/src/ggml-metal/kernels/binbcast.metal b/ggml/src/ggml-metal/kernels/binbcast.metal
+index 89c228e..e3500eb 100644
+--- a/ggml/src/ggml-metal/kernels/binbcast.metal
++++ b/ggml/src/ggml-metal/kernels/binbcast.metal
+@@ -207,7 +207,11 @@ kernel void kernel_repeat(
+         ushort3   ntg[[threads_per_threadgroup]]) {
+     const int i3 = tgpig.z;
+     const int i2 = tgpig.y;
+-    const int i1 = tgpig.x;
++    const int i1 = tgpig.x*ntg.y + tpitg.y; // byteplan: ntg.y rows per threadgroup (narrow rows)
++
++    if (i1 >= args.ne1) {
++        return;
++    }
+ 
+     const int i03 = i3%args.ne03;
+     const int i02 = i2%args.ne02;
+diff --git a/ggml/src/ggml-metal/kernels/fa_f16.metal b/ggml/src/ggml-metal/kernels/fa_f16.metal
+index 2dfd379..ded9547 100644
+--- a/ggml/src/ggml-metal/kernels/fa_f16.metal
++++ b/ggml/src/ggml-metal/kernels/fa_f16.metal
+@@ -361,3 +361,197 @@ template [[host_name("kernel_flash_attn_ext_tensor_f16_dk512_dv512")]] kernel fl
+ template [[host_name("kernel_flash_attn_ext_tensor_f16_dk576_dv512")]] kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<576, 512, OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE>;
+ 
+ #endif // GGML_METAL_HAS_TENSOR
++
++// byteplan: sparse prefill attention on simdgroup MMA. One threadgroup per (query, KV head) runs all heads of the KV
++// group (at most R) as the rows of one Q tile over the query's index list from kernel_flash_attn_ext_vec_idx, in
++// chunks of C rows. The heads of a query share its selection, so each K/V row is read once for all of them, straight
++// from the cache into the simdgroup matrices (thread_elements layout). f16 K/V; no ALiBi, softcap or sinks (the host
++// checks).
++template<short DK, short DV>
++kernel void kernel_flash_attn_ext_sparse(
++        constant ggml_metal_kargs_flash_attn_ext_vec & args,
++        device const char * q,
++        device const char * k,
++        device const char * v,
++        device const char * mask,
++        device const char * idx,
++        device       char * dst,
++        threadgroup  half * shmem_f16 [[threadgroup(0)]],
++        uint3   tgpig[[threadgroup_position_in_grid]],
++        ushort  tiitg[[thread_index_in_threadgroup]],
++        ushort  tiisg[[thread_index_in_simdgroup]],
++        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
++    constexpr short R   = 16;
++    constexpr short C   = 32;
++    constexpr short NSG = 4;
++    constexpr short NT  = NSG*N_SIMDWIDTH;
++    constexpr short NJ  = DV/8/NSG;
++    constexpr short RS  = R/NSG;
++
++    static_assert(C == N_SIMDWIDTH && C/8 == NSG, "chunk");
++    static_assert(DK % 8 == 0 && DV % (8*NSG) == 0, "head sizes");
++
++    const int iq1  = tgpig[0];
++    const int ikv2 = tgpig[1];
++    const int iq3  = tgpig[2];
++
++    const int G  = args.ne02/args.ne_12_2;
++    const int h0 = ikv2*G;
++
++    threadgroup half  * sq  = shmem_f16;                         // R x DK
++    threadgroup float * ss  = (threadgroup float *) (sq + R*DK); // 2 x R x C (double buffered)
++    threadgroup float * sms = ss + 2*R*C;                        // R
++    threadgroup half  * smk = (threadgroup half *) (sms + R);    // C
++
++    k += ikv2*args.nb12 + (iq3/(args.ne03/args.ne_12_3))*args.nb13;
++    v += ikv2*args.nb22 + (iq3/(args.ne03/args.ne_12_3))*args.nb23;
++
++    device const half * pm   = (device const half *) (mask + iq1*args.nb31 + (iq3%args.ne33)*args.nb33);
++    device const int  * pidx = (device const int *) idx + ((int64_t) (iq3%args.ne33)*args.ne31 + iq1%args.ne31)*args.n_kv_max_padded;
++
++    for (int i = tiitg; i < R*DK/4; i += NT) {
++        const int r = i/(DK/4);
++        ((threadgroup half4 *) sq)[i] = r < G
++            ? (half4) ((device const float4 *) (q + iq1*args.nb01 + (h0 + r)*args.nb02 + iq3*args.nb03))[i%(DK/4)]
++            : half4(0.0h);
++    }
++
++    simdgroup_float8x8 lo[2][NJ];
++    FOR_UNROLL (short rf = 0; rf < 2; ++rf) {
++        FOR_UNROLL (short j = 0; j < NJ; ++j) {
++            lo[rf][j] = make_filled_simdgroup_matrix<float, 8>(0.0f);
++        }
++    }
++
++    float M[RS];
++    float S[RS];
++    FOR_UNROLL (short j = 0; j < RS; ++j) {
++        M[j] = -FLT_MAX/2;
++        S[j] = 0.0f;
++    }
++
++    // this thread's two elements of an 8x8 simdgroup matrix: row fm, columns fn and fn + 1
++    const short fm = (tiisg/4 & 4) + (tiisg/2)%4;
++    const short fn = (tiisg/4 & 2)*2 + (tiisg%2)*2;
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    for (int ic = 0, b = 0; ic < args.n_kv_max_padded; ic += C, b ^= 1) {
++        if (pidx[ic] < 0) {
++            break;
++        }
++
++        threadgroup float * sb = ss + b*R*C;
++
++        if (tiitg < C) {
++            const int i11 = pidx[ic + tiitg];
++            smk[tiitg] = i11 >= 0 ? pm[i11] : -INFINITY;
++        }
++
++        // S^T = K*Q^T: simdgroup s takes keys 8s..8s+7; its lanes read their key row straight from the cache
++        {
++            const int  i11 = pidx[ic + 8*sgitg + fm];
++            device const half2 * pk = (device const half2 *) (k + max(i11, 0)*args.nb11) + fn/2;
++
++            simdgroup_float8x8 mqk[2] = { make_filled_simdgroup_matrix<float, 8>(0.0f), make_filled_simdgroup_matrix<float, 8>(0.0f) };
++
++            FOR_UNROLL (short i = 0; i < DK/8; ++i) {
++                simdgroup_half8x8 mk;
++                simdgroup_half8x8 mq0;
++                simdgroup_half8x8 mq1;
++
++                const half2 kv2 = i11 >= 0 ? pk[4*i] : half2(0.0h);
++                mk.thread_elements()[0] = kv2[0];
++                mk.thread_elements()[1] = kv2[1];
++
++                simdgroup_load(mq0, sq + 8*i,        DK, 0, true);
++                simdgroup_load(mq1, sq + 8*DK + 8*i, DK, 0, true);
++
++                simdgroup_multiply_accumulate(mqk[0], mk, mq0, mqk[0]);
++                simdgroup_multiply_accumulate(mqk[1], mk, mq1, mqk[1]);
++            }
++
++            simdgroup_store(mqk[0], sb +       8*sgitg, C, 0, true);
++            simdgroup_store(mqk[1], sb + 8*C + 8*sgitg, C, 0, true);
++        }
++
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        FOR_UNROLL (short j = 0; j < RS; ++j) {
++            const short r = sgitg + NSG*j;
++
++            const float s = fma(sb[r*C + tiisg], args.scale, (float) smk[tiisg]);
++            const float m = M[j];
++
++            M[j] = simd_max(max(m, s));
++
++            const float ms = exp(m - M[j]);
++            const float vs = exp(s - M[j]);
++
++            S[j] = S[j]*ms + simd_sum(vs);
++
++            sb[r*C + tiisg] = vs;
++            if (tiisg == 0) {
++                sms[r] = ms;
++            }
++        }
++
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        // O = diag(ms)*O + P*V: simdgroup s owns output columns [8*NJ*s, 8*NJ*(s + 1))
++        FOR_UNROLL (short rf = 0; rf < 2; ++rf) {
++            const float ms = sms[8*rf + fm];
++
++            FOR_UNROLL (short j = 0; j < NJ; ++j) {
++                thread auto & te = lo[rf][j].thread_elements();
++                te[0] *= ms;
++                te[1] *= ms;
++            }
++        }
++
++        FOR_UNROLL (short kc = 0; kc < C/8; ++kc) {
++            simdgroup_float8x8 mp0;
++            simdgroup_float8x8 mp1;
++            simdgroup_load(mp0, sb +       8*kc, C, 0, false);
++            simdgroup_load(mp1, sb + 8*C + 8*kc, C, 0, false);
++
++            const int i11 = pidx[ic + 8*kc + fm];
++            device const half2 * pv = (device const half2 *) (v + max(i11, 0)*args.nb21) + (8*NJ*sgitg + fn)/2;
++
++            FOR_UNROLL (short j = 0; j < NJ; ++j) {
++                simdgroup_half8x8 mv;
++                const half2 vv2 = i11 >= 0 ? pv[4*j] : half2(0.0h);
++                mv.thread_elements()[0] = vv2[0];
++                mv.thread_elements()[1] = vv2[1];
++
++                simdgroup_multiply_accumulate(lo[0][j], mp0, mv, lo[0][j]);
++                simdgroup_multiply_accumulate(lo[1][j], mp1, mv, lo[1][j]);
++            }
++        }
++    }
++
++    FOR_UNROLL (short j = 0; j < RS; ++j) {
++        if (tiisg == 0) {
++            sms[sgitg + NSG*j] = S[j] == 0.0f ? 0.0f : 1.0f/S[j];
++        }
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    FOR_UNROLL (short rf = 0; rf < 2; ++rf) {
++        const int r = 8*rf + fm;
++        if (r < G) {
++            device float2 * pd = (device float2 *) ((device float *) dst + ((uint64_t) iq3*args.ne2*args.ne1 + h0 + r + (uint64_t) iq1*args.ne1)*DV + 8*NJ*sgitg + fn);
++            const float is = sms[r];
++            FOR_UNROLL (short j = 0; j < NJ; ++j) {
++                thread auto & te = lo[rf][j].thread_elements();
++                pd[4*j] = float2(te[0], te[1])*is;
++            }
++        }
++    }
++}
++
++typedef decltype(kernel_flash_attn_ext_sparse<256, 256>) flash_attn_ext_sparse_t;
++
++template [[host_name("kernel_flash_attn_ext_sparse_f16_dk128_dv128")]] kernel flash_attn_ext_sparse_t kernel_flash_attn_ext_sparse<128, 128>;
++template [[host_name("kernel_flash_attn_ext_sparse_f16_dk256_dv256")]] kernel flash_attn_ext_sparse_t kernel_flash_attn_ext_sparse<256, 256>;
+diff --git a/ggml/src/ggml-metal/kernels/mul_mm.metal b/ggml/src/ggml-metal/kernels/mul_mm.metal
+index 6d1162c..800a82e 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mm.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mm.metal
+@@ -8,6 +8,8 @@ constant short FC_mul_mm_ne13  [[function_constant(FC_MUL_MM + 3)]];
+ constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
+ constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
+ constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
++// byteplan: 64 instead of 32 src1 rows per threadgroup, so every dequantized weight tile serves twice the rows
++constant bool FC_mul_mm_r64 [[function_constant(FC_MUL_MM + 7)]];
+ 
+ // each block_q contains 16*nl weights
+ #ifdef GGML_METAL_HAS_TENSOR
+@@ -162,7 +164,9 @@ kernel void kernel_mul_mm(
+     threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
+ 
+     constexpr int NR0 = 64;
+-    constexpr int NR1 = 32;
++    const     int NR1 = FC_mul_mm_r64 ? 64 : 32;
++    const     int NB1 = NR1/8;  // 8-row blocks of src1 in sb
++    const     int NMC = NR1/4;  // 8x8 accumulators per simdgroup
+ 
+     constexpr int NK  = 32;
+     constexpr int NL0 = NK/16;
+@@ -179,6 +183,7 @@ kernel void kernel_mul_mm(
+     // a thread shouldn't load data outside of the matrix
+     const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1; // 0 .. 63
+     const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1; // 0 .. 31
++    const short lr2 = ((short)tiitg/NL1) + 32 < nr1 ? ((short)tiitg/NL1) + 32 : nr1 - 1; // 32 .. 63 (FC_mul_mm_r64)
+ 
+     const short il0 = (tiitg % NL0);
+ 
+@@ -200,12 +205,14 @@ kernel void kernel_mul_mm(
+         + args.nb11*(r1 + lr1)
+         + args.nb10*iy);
+ 
++    device const T1 * y2 = (device const T1 *)((device const char *) y + args.nb11*(lr2 - lr1));
++
+     S0_8x8 ma[4];
+-    S1_8x8 mb[2];
++    S1_8x8 mb[4];
+ 
+-    simdgroup_float8x8 mc[8];
++    simdgroup_float8x8 mc[16];
+ 
+-    for (short i = 0; i < 8; i++){
++    for (short i = 0; i < NMC; i++){
+         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+     }
+ 
+@@ -262,9 +269,12 @@ kernel void kernel_mul_mm(
+               //const short lx = (tiitg/NL1)%8;
+               //const short ly = i;
+ 
+-                const short ib = 4*sx + sy;
++                const short ib = NB1*sx + sy;
+ 
+                 *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
++                if (FC_mul_mm_r64) {
++                    *(sb + 64*(ib + 4) + 8*ly + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y2 + i) : 0;
++                }
+             }
+         } else {
+             const short sx = (tiitg%NL1);
+@@ -275,21 +285,25 @@ kernel void kernel_mul_mm(
+ 
+             const short ly = (tiitg/NL1)%8;
+ 
+-            const short ib = 4*sx + sy;
++            const short ib = NB1*sx + sy;
+ 
+             *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y));
++            if (FC_mul_mm_r64) {
++                *(threadgroup S1_2x4 *)(sb + 64*(ib + 4) + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y2));
++            }
+         }
+ 
+         il = (il + 2 < nl) ? il + 2 : il % 2;
+         x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
+ 
+-        y += NK;
++        y  += NK;
++        y2 += NK;
+ 
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+         // load matrices from threadgroup memory and conduct outer products
+         threadgroup const S0 * lsma = (sa + 4*64*(sgitg%2));
+-        threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/2));
++        threadgroup const S1 * lsmb = (sb + (NB1/2)*64*(sgitg/2));
+ 
+         FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+             simdgroup_barrier(mem_flags::mem_none);
+@@ -300,18 +314,18 @@ kernel void kernel_mul_mm(
+ 
+             simdgroup_barrier(mem_flags::mem_none);
+ 
+-            FOR_UNROLL (short i = 0; i < 2; i++) {
++            FOR_UNROLL (short i = 0; i < NB1/2; i++) {
+                 simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+             }
+ 
+             simdgroup_barrier(mem_flags::mem_none);
+ 
+-            FOR_UNROLL (short i = 0; i < 8; i++){
++            FOR_UNROLL (short i = 0; i < NMC; i++){
+                 simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+             }
+ 
+             lsma += 8*64;
+-            lsmb += 4*64;
++            lsmb += NB1*64;
+         }
+     }
+ 
+@@ -319,25 +333,25 @@ kernel void kernel_mul_mm(
+         // if no bounds checks on the output are needed, we can directly write to device memory
+         device float * C = (device float *) dst +
+             (r0 + 32*(sgitg &  1)) + \
+-            (r1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
++            (r1 + (NR1/2)*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
+ 
+-        for (short i = 0; i < 8; i++) {
++        for (short i = 0; i < NMC; i++) {
+             simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+         }
+     } else {
+         // block is smaller than 64x32, we should avoid writing data outside of the matrix
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+-        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
++        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + ((NR1/2)*(sgitg >> 1))*NR0;
+ 
+-        for (short i = 0; i < 8; i++) {
++        for (short i = 0; i < NMC; i++) {
+             simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+         }
+ 
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+         if (sgitg == 0) {
+-            for (int j = tiitg; j < nr1; j += NR1) {
++            for (int j = tiitg; j < nr1; j += 32) {
+                 device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
+                 device float4 * D4 = (device float4 *) D;
+ 
+diff --git a/ggml/src/ggml-metal/kernels/quantize.metal b/ggml/src/ggml-metal/kernels/quantize.metal
+index 73679b9..facb331 100644
+--- a/ggml/src/ggml-metal/kernels/quantize.metal
++++ b/ggml/src/ggml-metal/kernels/quantize.metal
+@@ -300,13 +300,20 @@ kernel void kernel_get_rows_f(
+         device const void * src1,
+         device       void * dst,
+         uint3               tgpig[[threadgroup_position_in_grid]],
+-        ushort              tiitg[[thread_index_in_threadgroup]],
++        ushort3             tpitg[[thread_position_in_threadgroup]],
+         ushort3             ntg [[threads_per_threadgroup]]) {
+-    const int32_t iw0 = tgpig.x/args.ne10;
+-    const int32_t i10 = tgpig.x%args.ne10;
++    // byteplan: ntg.y rows per threadgroup (narrow rows)
++    const int32_t nrb = (args.ne10 + ntg.y - 1)/ntg.y;
++
++    const int32_t iw0 = tgpig.x/nrb;
++    const int32_t i10 = (tgpig.x%nrb)*ntg.y + tpitg.y;
+     const int32_t i11 = tgpig.y;
+     const int32_t i12 = tgpig.z;
+ 
++    if (i10 >= args.ne10) {
++        return;
++    }
++
+     const int32_t r = ((const device int32_t *) ((const device char *) src1 + i12*args.nb12 + i11*args.nb11 + i10*args.nb10))[0];
+ 
+     const int32_t i02 = i11;
+@@ -315,7 +322,7 @@ kernel void kernel_get_rows_f(
+     auto psrc = (const device T0 *) ((const device char *) src0 + i03*args.nb03 + i02*args.nb02 +   r*args.nb01);
+     auto pdst = (      device T  *) ((      device char *)  dst + i12*args.nb3  + i11*args.nb2  + i10*args.nb1);
+ 
+-    for (int ind = iw0*ntg.x + tiitg; ind < args.ne00t;) {
++    for (int ind = iw0*ntg.x + tpitg.x; ind < args.ne00t;) {
+         pdst[ind] = psrc[ind];
+ 
+         break;
+diff --git a/ggml/src/ggml-metal/kernels/unary.metal b/ggml/src/ggml-metal/kernels/unary.metal
+index 473c5c9..ac7a158 100644
+--- a/ggml/src/ggml-metal/kernels/unary.metal
++++ b/ggml/src/ggml-metal/kernels/unary.metal
+@@ -30,10 +30,17 @@ kernel void kernel_unary_impl(
+         src0_ptr = (device const T0 *) (src0);
+         dst_ptr  = (device       T  *) (dst);
+     } else {
++        // byteplan: ntg.y rows per threadgroup (narrow rows), same element math
++        const int nrb = (args.ne01 + ntg.y - 1)/ntg.y;
++
+         const int i03 = tgpig.z;
+         const int i02 = tgpig.y;
+-        const int k0  = tgpig.x/args.ne01;
+-        const int i01 = tgpig.x - k0*args.ne01;
++        const int k0  = tgpig.x/nrb;
++        const int i01 = (tgpig.x - k0*nrb)*ntg.y + tpitg.y;
++
++        if (i01 >= args.ne01) {
++            return;
++        }
+ 
+         i0 = k0*ntg.x + tpitg.x;
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b675853..6b18d3b 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11871,6 +11871,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051));
+     }
+ 
++    // byteplan: qwen4exp dense prefill matmuls (1024-token ubatch)
++    for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
++        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, 1024, 2560, {1, 1}, {1, 1}));
++    }
++
+     // byteplan: qwen4exp expert prefill, 512 experts top-10 in Q2_0: gate/up (shared token rows) and down
+     for (int bs : {1024, 2048}) {
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, true,  640,  bs, 2560));
+-- 
+2.53.0
+

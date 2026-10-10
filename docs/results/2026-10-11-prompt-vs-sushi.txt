@@ -1,0 +1,32 @@
+Prompt reading, Byteplan vs sushi (lossless: --kv-quant 16 --no-decode-attn-quant), MacBook Pro M3 Max 64 GB, 2026-10-11.
+7,000-token prompt (24,000 characters of this repository's source), chat completion, wall time on the client, max_tokens 1.
+Each engine start reads 3 prompts with a fresh first line (nothing cached); the median of the 3 counts. Order A B, B A, A B, B A.
+Byteplan: bin/chat settings (MTP + n-gram drafts, -ub 2048, checkpoints), same request as the prompt test of tools/bench/vs_sushi.py.
+The first prompt after a start is slower for both (sushi ~350-380 tok/s, Byteplan ~600); the median of 3 leaves it out.
+Test 1 ran the build up to patch 0026, test 2 the build with all 27 patches.
+
+Test 1
+  Byteplan         prompt   638 tok/s [615, 638, 645] (6995 tok)
+  sushi-lossless   prompt   667 tok/s [381, 667, 679] (6995 tok)
+  sushi-lossless   prompt   627 tok/s [373, 627, 633] (6995 tok)
+  Byteplan         prompt   660 tok/s [602, 661, 660] (6995 tok)
+  Byteplan         prompt   657 tok/s [657, 659, 655] (6995 tok)
+  sushi-lossless   prompt   653 tok/s [348, 655, 653] (6995 tok)
+  sushi-lossless   prompt   645 tok/s [369, 645, 653] (6995 tok)
+  Byteplan         prompt   662 tok/s [607, 665, 662] (6995 tok)
+Byteplan         median   658  all [638, 660, 657, 662]
+sushi-lossless   median   649  all [667, 627, 653, 645]
+Byteplan vs sushi: +1.4%
+
+Test 2
+  Byteplan         prompt   631 tok/s [626, 631, 633] (6998 tok)
+  sushi-lossless   prompt   639 tok/s [353, 639, 656] (6998 tok)
+  sushi-lossless   prompt   649 tok/s [351, 654, 649] (6998 tok)
+  Byteplan         prompt   663 tok/s [607, 664, 663] (6998 tok)
+  Byteplan         prompt   666 tok/s [666, 667, 664] (6998 tok)
+  sushi-lossless   prompt   614 tok/s [356, 656, 614] (6998 tok)
+  sushi-lossless   prompt   622 tok/s [603, 622, 623] (6998 tok)
+  Byteplan         prompt   605 tok/s [565, 616, 605] (6998 tok)
+Byteplan         median   647  all [631, 663, 666, 605]
+sushi-lossless   median   630  all [639, 649, 614, 622]
+Byteplan vs sushi: +2.6%

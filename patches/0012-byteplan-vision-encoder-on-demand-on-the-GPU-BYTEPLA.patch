@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sat, 10 Oct 2026 10:46:29 +0200
+Subject: [PATCH 12/27] byteplan: vision encoder on demand on the GPU
+ (BYTEPLAN_MMPROJ_LAZY_GPU=1 with --no-mmproj-offload)
+
+The CPU mtmd context stays for tokenization and capabilities; the first image loads a GPU
+copy (0.37 s) that encodes it: a 1495-token screenshot took 164 s on the CPU, 5.8 s now.
+The GPU copy is freed by the next request after 10 minutes without images.
+---
+ tools/server/server-context.cpp | 71 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 70 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 58869e0..20cc363 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -242,6 +242,55 @@ struct server_batch {
+     }
+ };
+ 
++// byteplan: vision encoder on demand on the GPU (BYTEPLAN_MMPROJ_LAZY_GPU=1 with --no-mmproj-offload). The CPU context
++// stays for tokenization and capabilities; the first image loads a GPU copy that encodes in about a second instead of a
++// minute on the CPU, and a request after 10 idle minutes frees it again (wired GPU memory only while images are used)
++struct mtmd_lazy_gpu {
++    std::string           path;
++    mtmd_context_params   params = {};
++    const llama_model *   model  = nullptr;
++    mtmd_context *        gpu    = nullptr;
++    int64_t               t_last_us = 0;
++    bool                  enabled   = false;
++
++    mtmd_context * get(mtmd_context * fallback) {
++        if (!enabled) {
++            return fallback;
++        }
++        if (gpu == nullptr) {
++            const int64_t t0 = ggml_time_us();
++            mtmd_context_params p = params;
++            p.use_gpu = true;
++            gpu = mtmd_init_from_file(path.c_str(), model, p);
++            if (gpu == nullptr) {
++                SRV_ERR("%s", "failed to load the vision encoder on the GPU, staying on the CPU\n");
++                enabled = false;
++                return fallback;
++            }
++            SRV_INF("vision encoder loaded on the GPU in %.2f s\n", (ggml_time_us() - t0) / 1e6);
++        }
++        t_last_us = ggml_time_us();
++        return gpu;
++    }
++
++    void release_if_idle(int64_t idle_us) {
++        if (gpu != nullptr && ggml_time_us() - t_last_us > idle_us) {
++            mtmd_free(gpu);
++            gpu = nullptr;
++            SRV_INF("%s", "vision encoder released from the GPU (idle)\n");
++        }
++    }
++
++    void reset() {
++        mtmd_free(gpu);
++        gpu = nullptr;
++    }
++
++    ~mtmd_lazy_gpu() {
++        reset();
++    }
++};
++
+ struct server_slot {
+     int id;
+ 
+@@ -252,6 +301,7 @@ struct server_slot {
+ 
+     // multimodal
+     mtmd_context * mctx = nullptr;
++    mtmd_lazy_gpu * mlazy = nullptr; // byteplan: encoder on demand on the GPU
+     mtmd::batch_ptr mbatch = nullptr;
+ 
+     // speculative decoding
+@@ -783,7 +833,7 @@ struct server_slot {
+ // encode the mtmd chunk at idx, batched with as many of the next chunks as possible
+ // returns 0 on success
+ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx) {
+-    const auto & mctx = slot.mctx;
++    mtmd_context * mctx = slot.mlazy ? slot.mlazy->get(slot.mctx) : slot.mctx;
+     const auto & input_tokens = slot.task->tokens;
+     const auto & chunk = input_tokens.find_chunk(idx);
+ 
+@@ -939,6 +989,7 @@ public:
+     llama_model * model_tgt = nullptr;
+ 
+     mtmd_context * mctx = nullptr;
++    mtmd_lazy_gpu  mlazy;           // byteplan: vision encoder on demand on the GPU
+     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
+     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
+     const llama_vocab * vocab = nullptr;
+@@ -1048,6 +1099,7 @@ private:
+         ctx_tgt = nullptr;
+         model_tgt = nullptr;
+ 
++        mlazy.reset();
+         mtmd_free(mctx);
+         mctx = nullptr;
+     }
+@@ -1306,6 +1358,17 @@ private:
+             }
+             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+ 
++            if (!mparams.use_gpu && getenv("BYTEPLAN_MMPROJ_LAZY_GPU") != nullptr) {
++                mlazy.path    = mmproj_path;
++                mlazy.params  = mparams;
++                // the load-progress callback points into load_model()'s stack, gone when the first image arrives
++                mlazy.params.progress_callback           = nullptr;
++                mlazy.params.progress_callback_user_data = nullptr;
++                mlazy.model   = model_tgt;
++                mlazy.enabled = true;
++                SRV_INF("%s", "vision encoder: CPU copy for tokenization, GPU copy on the first image\n");
++            }
++
+             init_opt.video_params.fps_target = params_base.video_fps;
+             init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
+             init_opt.video_params.ffmpeg_bin_dir = params_base.video_ffmpeg_bin_dir.empty()
+@@ -1435,6 +1498,7 @@ private:
+             slot.n_ctx   = n_ctx_slot();
+ 
+             slot.mctx                   = mctx;
++            slot.mlazy                  = mlazy.enabled ? &mlazy : nullptr;
+             slot.prompt.tokens.has_mtmd = mctx != nullptr;
+ 
+             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
+@@ -1845,6 +1909,11 @@ private:
+     }
+ 
+     bool launch_slot_with_task(server_slot & slot, server_task && task) {
++        // byteplan: free the GPU vision encoder after 10 minutes without images, once no slot is busy
++        if (mlazy.gpu != nullptr && std::none_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.is_processing(); })) {
++            mlazy.release_if_idle(600ll * 1000 * 1000);
++        }
++
+         // process per-request lora adapters
+         if (!task.params.lora.empty()) {
+             auto task_loras = construct_lora_list(task.params.lora);
+-- 
+2.53.0
+

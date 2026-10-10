@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Fri, 9 Oct 2026 17:54:55 +0200
+Subject: [PATCH 08/27] byteplan: metal fusions bit-identical to the unfused
+ ops + fusion bisect knobs
+
+- moe_reduce: no fma contraction, products and the left-to-right sum round like MUL + ADD chain
+- rms_norm+scale: no reassociation into x*(scale*s)
+- GGML_METAL_FUSION_SKIP=tok,.. / GGML_METAL_FUSION_ONLY=label to bisect fusions
+
+qwen4exp amplifies 1-ulp differences to KL ~1e-2 (top-1 ~96 %), so a fusion that only
+rounds differently is not distinguishable from a bug and makes outputs depend on where
+command-buffer boundaries cut fusion groups. With these two fixes and the topk-moe fusion
+skipped (it is not faster here), the fused N_CB=8 graph matches the unfused graph bit for bit.
+---
+ ggml/src/ggml-metal/ggml-metal-fusion.cpp | 29 ++++++++++++++++++++++-
+ ggml/src/ggml-metal/kernels/argsort.metal |  7 ++++--
+ ggml/src/ggml-metal/kernels/norm.metal    |  3 +++
+ 3 files changed, 36 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.cpp b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+index c0dbb1e..feea942 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <algorithm>
+ #include <cstddef>
++#include <cstdlib>
+ #include <cstring>
+ #include <set>
+ #include <string>
+@@ -1154,6 +1155,32 @@ static bool ggml_metal_fusion_check_memory_ranges(
+ 
+ // find the longest pattern matching the node sequence starting at idx
+ // (idx is a position in node_idxs, which maps to graph node indices)
++// byteplan debug knobs to bisect fusions: GGML_METAL_FUSION_SKIP=tok1,tok2 disables every pattern whose label
++// (e.g. "RMS_NORM+MUL") contains one of the tokens; GGML_METAL_FUSION_ONLY=label keeps only that exact pattern
++static bool ggml_metal_fusion_skipped(const ggml_metal_fusion & fusion) {
++    static const std::vector<bool> skip = [] {
++        std::vector<bool> res(ggml_metal_fusions.size(), false);
++        const char * env  = getenv("GGML_METAL_FUSION_SKIP");
++        const char * only = getenv("GGML_METAL_FUSION_ONLY");
++        const std::string toks = env ? env : "";
++        for (size_t i = 0; i < res.size(); i++) {
++            const std::string label = ggml_metal_fusion_label(&ggml_metal_fusions[i]);
++            res[i] = only != nullptr && label != only;
++            for (size_t p = 0; p < toks.size();) {
++                const size_t q   = std::min(toks.find(',', p), toks.size());
++                const std::string tok = toks.substr(p, q - p);
++                res[i] = res[i] || (!tok.empty() && label.find(tok) != std::string::npos);
++                p = q + 1;
++            }
++            if (res[i] && env != nullptr) {
++                GGML_LOG_INFO("%s: fusion %s skipped\n", __func__, label.c_str());
++            }
++        }
++        return res;
++    }();
++    return skip[&fusion - ggml_metal_fusions.data()];
++}
++
+ const ggml_metal_fusion * ggml_metal_fusion_next(
+         const ggml_cgraph * gf,
+         const int * node_idxs,
+@@ -1168,7 +1195,7 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
+         const int n_ops = (int) fusion.ops.size();
+ 
+         // only look for a longer match than the current best
+-        if (n_ops <= best) {
++        if (n_ops <= best || ggml_metal_fusion_skipped(fusion)) {
+             continue;
+         }
+         if (idx + n_ops > n_idxs) {
+diff --git a/ggml/src/ggml-metal/kernels/argsort.metal b/ggml/src/ggml-metal/kernels/argsort.metal
+index 5231b83..fc321ce 100644
+--- a/ggml/src/ggml-metal/kernels/argsort.metal
++++ b/ggml/src/ggml-metal/kernels/argsort.metal
+@@ -462,6 +462,9 @@ kernel void kernel_moe_reduce_f32(
+         uint3   tgpig[[threadgroup_position_in_grid]],
+         ushort3 tpitg[[thread_position_in_threadgroup]],
+         ushort3   ntg[[threads_per_threadgroup]]) {
++    // no fma contraction: products and the left-to-right sum round exactly like the unfused MUL + ADD chain,
++    // so the fusion stays bit-identical
++#pragma clang fp contract(off)
+     const int64_t token = tgpig.x;
+     const int64_t col   = (int64_t) tgpig.y * ntg.x + tpitg.x;
+     if (token >= args.ne02 || col >= args.ne00) {
+@@ -471,8 +474,8 @@ kernel void kernel_moe_reduce_f32(
+     const int n_expert_used = FC_moe_reduce_n_expert_used;
+ 
+     const int64_t base = token * (int64_t) n_expert_used * args.ne00 + col;
+-    float sum = 0.0f;
+-    FOR_UNROLL (int e = 0; e < n_expert_used; ++e) {
++    float sum = experts[base] * weights[token * n_expert_used];
++    FOR_UNROLL (int e = 1; e < n_expert_used; ++e) {
+         sum += experts[base + e * args.ne00] * weights[token * n_expert_used + e];
+     }
+     dst[token * args.ne00 + col] = sum;
+diff --git a/ggml/src/ggml-metal/kernels/norm.metal b/ggml/src/ggml-metal/kernels/norm.metal
+index c76d0c7..e38a9ef 100644
+--- a/ggml/src/ggml-metal/kernels/norm.metal
++++ b/ggml/src/ggml-metal/kernels/norm.metal
+@@ -162,6 +162,9 @@ kernel void kernel_rms_norm_fuse_impl(
+         }
+         if (F == 2) {
+             if (FC_norm_use_scale) {
++                // byteplan: no reassociation into x*(scale*args.scale), so the fusion rounds exactly like
++                // the unfused RMS_NORM + SCALE (bit-identical)
++#pragma clang fp reassociate(off)
+                 y[i00] = (x[i00]*scale) * args.scale;
+             } else {
+                 y[i00] = (x[i00]*scale)*f0[i00];
+-- 
+2.53.0
+

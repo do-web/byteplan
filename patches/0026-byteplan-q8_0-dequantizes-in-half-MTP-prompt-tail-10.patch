@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sun, 11 Oct 2026 13:31:25 +0200
+Subject: [PATCH 26/27] byteplan: q8_0 dequantizes in half, MTP prompt tail
+ 1024
+
+q*d (q an int8, d a half) rounds once to half either way, so the half tiles take the half math: same values. The MTP
+head now catches up on the last 1024 prompt tokens (was 2048): prompt reading +3 %, the answer after a 7k prompt
+unchanged.
+---
+ ggml/src/ggml-metal/kernels/dequantize.h | 15 +++++++++++++++
+ tools/server/server-context.cpp          |  4 ++--
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/kernels/dequantize.h b/ggml/src/ggml-metal/kernels/dequantize.h
+index 475330a..eba8a39 100644
+--- a/ggml/src/ggml-metal/kernels/dequantize.h
++++ b/ggml/src/ggml-metal/kernels/dequantize.h
+@@ -345,6 +345,21 @@ void dequantize_q5_1_t4(device const block_q5_1 * xb, short il, thread type4 & r
+ template <typename type4x4>
+ void dequantize_q8_0(device const block_q8_0 *xb, short il, thread type4x4 & reg) {
+     device const packed_char4 * qs = (device const packed_char4 *) xb->qs;
++
++    if (is_same<type4x4, half4x4>::value) {
++        // byteplan: q*d (q an int8, d a half) rounds once to half either way: half math, same values
++        const half d = xb->d;
++
++        half4x4 reg_h;
++
++        for (int i = 0; i < 4; ++i) {
++            reg_h[i] = half4(qs[4*il + i]) * d;
++        }
++
++        reg = (type4x4) reg_h;
++        return;
++    }
++
+     const float d = xb->d;
+ 
+     float4x4 reg_f;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 6e1afd1..6bb3c52 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4426,10 +4426,10 @@ private:
+         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+         if (spec) {
+             // byteplan: drafts read the end of a long prompt (the head's QSA keeps at most 2048 cells), so the MTP head
+-            // skips its decode for prompt positions older than BYTEPLAN_MTP_PROMPT_TAIL (default 2048, 0 = all)
++            // skips its decode for prompt positions older than BYTEPLAN_MTP_PROMPT_TAIL (default 1024, 0 = all)
+             static const llama_pos mtp_prompt_tail = [] {
+                 const char * e = getenv("BYTEPLAN_MTP_PROMPT_TAIL");
+-                return e ? (llama_pos) atoi(e) : (llama_pos) 2048;
++                return e ? (llama_pos) atoi(e) : (llama_pos) 1024;
+             }();
+             for (auto & slot : slots) {
+                 const bool reading = mtp_prompt_tail > 0 && slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.task;
+-- 
+2.53.0
+

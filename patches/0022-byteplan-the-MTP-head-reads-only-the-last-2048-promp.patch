@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sun, 11 Oct 2026 12:00:38 +0200
+Subject: [PATCH 22/27] byteplan: the MTP head reads only the last 2048 prompt
+ tokens
+
+Its QSA keeps at most 2048 cells, so drafts read the end of a long prompt: the head skips its catch-up decode for
+older prompt positions (BYTEPLAN_MTP_PROMPT_TAIL, default 2048, 0 = all). Positions stay absolute, the pending_h
+chaining continues. Prompt reading +7 %, the answer after a 7k prompt unchanged.
+---
+ common/speculative.cpp          | 30 +++++++++++++++++++++++++++++-
+ common/speculative.h            |  3 +++
+ tools/server/server-context.cpp | 12 ++++++++++++
+ 3 files changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index a7f095a..33f481c 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -206,6 +206,9 @@ struct common_speculative_impl {
+ 
+     virtual bool process(const common_batch & batch) = 0;
+ 
++    // byteplan: see common_speculative_set_process_from
++    virtual void set_process_from(llama_seq_id /*seq_id*/, llama_pos /*pos*/) {}
++
+     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
+ 
+     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
+@@ -1425,6 +1428,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<int>                i_last;
+     std::vector<std::vector<float>> chain_h;
+ 
++    // byteplan: rows of a prompt batch before process_from[seq] skip the catch-up decode. The head attends through
++    // QSA (at most 2048 selected keys), so the end of a long prompt is what its drafts read; the pending_h chaining
++    // continues as usual and positions stay absolute.
++    std::vector<llama_pos> process_from;
++
++    void set_process_from(llama_seq_id seq_id, llama_pos pos) override {
++        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
++            process_from[seq_id] = pos;
++        }
++    }
++
+     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
+         , params(params.draft)
+@@ -1492,6 +1506,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         this->n_max = this->params.n_max;
+ 
+         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
++        process_from.assign(n_seq, -1);
+ 
+         i_last.assign(n_seq, -1);
+         i_batch_beg.assign(n_seq, -1);
+@@ -1583,6 +1598,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             for (int k = 0; k < n_tokens; ++k) {
+                 const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+ 
++                if (batch_in.tokens[k].pos[0] < process_from[seq_id]) {
++                    continue;
++                }
++
+                 const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
+ 
+                 const float * h_row = k == i_batch_beg[seq_id]
+@@ -1595,7 +1614,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             auto * mem_dft = llama_get_memory(ctx_dft);
+ 
+             bool ok = true;
+-            for (int head = 0; head < n_mtp_layers; ++head) {
++            for (int head = 0; head < n_mtp_layers && batch.size() > 0; ++head) {
+                 if (chain_heads) {
+                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
+                     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+@@ -2851,6 +2870,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
+     }
+ }
+ 
++void common_speculative_set_process_from(common_speculative * spec, llama_seq_id seq_id, llama_pos pos) {
++    if (spec == nullptr) {
++        return;
++    }
++    for (auto & impl : spec->impls) {
++        impl->set_process_from(seq_id, pos);
++    }
++}
++
+ bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
+     bool result = true;
+ 
+diff --git a/common/speculative.h b/common/speculative.h
+index a598468..825fbe3 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -89,6 +89,9 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
+ // process the batch and update the internal state of the speculative context
+ bool common_speculative_process(common_speculative * spec, const common_batch & batch);
+ 
++// byteplan: prompt positions before pos are not needed for drafting (the MTP head skips its decode for them); -1 = all
++void common_speculative_set_process_from(common_speculative * spec, llama_seq_id seq_id, llama_pos pos);
++
+ // generate drafts for the sequences specified with `common_speculative_get_draft_params`
+ void common_speculative_draft(common_speculative * spec);
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 11f0b1a..6e1afd1 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4425,6 +4425,18 @@ private:
+         //       for now, always re-evaluate for simplicity
+         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+         if (spec) {
++            // byteplan: drafts read the end of a long prompt (the head's QSA keeps at most 2048 cells), so the MTP head
++            // skips its decode for prompt positions older than BYTEPLAN_MTP_PROMPT_TAIL (default 2048, 0 = all)
++            static const llama_pos mtp_prompt_tail = [] {
++                const char * e = getenv("BYTEPLAN_MTP_PROMPT_TAIL");
++                return e ? (llama_pos) atoi(e) : (llama_pos) 2048;
++            }();
++            for (auto & slot : slots) {
++                const bool reading = mtp_prompt_tail > 0 && slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.task;
++                common_speculative_set_process_from(spec.get(), slot.id,
++                        reading ? (llama_pos) slot.task->n_tokens() - mtp_prompt_tail : -1);
++            }
++
+             bool ok = true;
+             queue_tasks.yield_to_queue([&]() {
+                 ok = common_speculative_process(spec.get(), batch.view);
+-- 
+2.53.0
+

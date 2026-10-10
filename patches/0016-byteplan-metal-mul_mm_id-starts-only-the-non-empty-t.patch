@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sat, 10 Oct 2026 20:42:59 +0200
+Subject: [PATCH 16/27] byteplan: metal mul_mm_id starts only the non-empty
+ token tiles (compact grid)
+
+---
+ ggml/src/ggml-metal/ggml-metal-ops.cpp   |  7 +++-
+ ggml/src/ggml-metal/kernels/mul_mm.metal | 52 +++++++++++++++++++++---
+ 2 files changed, 51 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 251f1f9..cb52a36 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2831,7 +2831,8 @@ size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {
+ 
+     const int64_t ne02 = op->src[0]->ne[2]; // n_expert
+ 
+-    return ggml_type_size(GGML_TYPE_I32)*ne02;
++    // byteplan: tokens per expert, then the first compact tile of each expert and the tile count
++    return ggml_type_size(GGML_TYPE_I32)*(2*ne02 + 1);
+ }
+ 
+ size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
+@@ -3016,7 +3017,9 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+ 
+             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+ 
+-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
++            // byteplan: one threadgroup per non-empty 32-token tile of an expert (at most ne21*ne20/32 + ne02 of them)
++            // instead of (ne21/32) x ne02, where at ubatch 1024 almost all start only to return; same tiles, same math
++            ggml_metal_encoder_dispatch_threadgroups(enc, (ne21*ne20 + 31)/32 + ne02, (ne01 + 63)/64, 1, 128, 1, 1);
+         }
+     } else {
+         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);
+diff --git a/ggml/src/ggml-metal/kernels/mul_mm.metal b/ggml/src/ggml-metal/kernels/mul_mm.metal
+index 9d262da..544399d 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mm.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mm.metal
+@@ -412,6 +412,30 @@ kernel void kernel_mul_mm_id_map0(
+ 
+     device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
+     tpe_u32[ide] = n_all;
++
++    // byteplan: first compact tile of each expert (exclusive prefix sum of its 32-token tiles) and the total,
++    // so kernel_mul_mm_id can start one threadgroup per non-empty tile
++    const uint32_t n_tiles = (n_all + 31)/32;
++    const ushort lane = tpitg % N_SIMDWIDTH;
++    const ushort sg   = tpitg / N_SIMDWIDTH;
++
++    threadgroup uint32_t * sg_sum = (threadgroup uint32_t *) shmem;
++
++    const uint32_t pre = simd_prefix_exclusive_sum(n_tiles);
++    if (lane == N_SIMDWIDTH - 1 || tpitg == ntg - 1) {
++        sg_sum[sg] = pre + n_tiles;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    uint32_t first = pre;
++    for (ushort i = 0; i < sg; ++i) {
++        first += sg_sum[i];
++    }
++    tpe_u32[args.ne02 + ide] = first;
++
++    if (ide == args.ne02 - 1) {
++        tpe_u32[2*args.ne02] = first + n_tiles;
++    }
+ }
+ 
+ kernel void kernel_mul_mm_id_amax_part_f32(
+@@ -533,19 +557,35 @@ kernel void kernel_mul_mm_id(
+     constexpr int NL0 = NK/16;
+     constexpr int NL1 = NK/8;
+ 
+-    const int im = tgpig.z; // expert
+-    const int r0 = tgpig.y*NR0;
+-    const int r1 = tgpig.x*NR1;
+-
+     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
+     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
+ 
+-    const int32_t neh1 = tpe_u32[im];
++    // byteplan: tgpig.x enumerates the non-empty 32-token tiles of all experts (compact grid, see map0)
++    device const uint32_t * tile0 = tpe_u32 + args.ne02;
+ 
+-    if (r1 >= neh1) {
++    const uint32_t it = tgpig.x;
++    if (it >= tile0[args.ne02]) {
+         return;
+     }
+ 
++    // the expert whose tiles contain it: the last e with tile0[e] <= it (empty experts share their tile0)
++    int lo = 0;
++    int hi = args.ne02 - 1;
++    while (lo < hi) {
++        const int mid = (lo + hi + 1)/2;
++        if (tile0[mid] <= it) {
++            lo = mid;
++        } else {
++            hi = mid - 1;
++        }
++    }
++
++    const int im = lo; // expert
++    const int r0 = tgpig.y*NR0;
++    const int r1 = (it - tile0[im])*NR1;
++
++    const int32_t neh1 = tpe_u32[im];
++
+     // if this block is of 64x32 shape or smaller
+     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+     const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
+-- 
+2.53.0
+

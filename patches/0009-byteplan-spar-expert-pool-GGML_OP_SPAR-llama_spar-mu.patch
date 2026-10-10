@@ -1,0 +1,1947 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sat, 10 Oct 2026 11:06:59 +0200
+Subject: [PATCH 09/27] byteplan: spar expert pool (GGML_OP_SPAR + llama_spar,
+ multi-pass MoE, LFU, per-layer slots, prefetch hints, preload progress)
+
+---
+ common/arg.cpp                            |  14 +
+ common/common.cpp                         |   4 +
+ common/common.h                           |   5 +
+ ggml/include/ggml.h                       |  61 ++
+ ggml/src/ggml-backend-meta.cpp            |   3 +-
+ ggml/src/ggml-cpu/ggml-cpu.c              |   8 +
+ ggml/src/ggml-cpu/ggml-cpu.cpp            |   2 +
+ ggml/src/ggml-metal/ggml-metal-device.cpp |  11 +
+ ggml/src/ggml-metal/ggml-metal-device.h   |   1 +
+ ggml/src/ggml-metal/ggml-metal-device.m   |   2 +
+ ggml/src/ggml-metal/ggml-metal-impl.h     |  24 +
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    |  59 ++
+ ggml/src/ggml-metal/ggml-metal-ops.h      |   1 +
+ ggml/src/ggml-metal/kernels/misc.metal    | 107 +++
+ ggml/src/ggml-metal/kernels/mul_mv.metal  |   5 +
+ ggml/src/ggml.c                           | 101 ++-
+ include/llama.h                           |   7 +
+ src/CMakeLists.txt                        |   1 +
+ src/llama-context.cpp                     |  25 +
+ src/llama-context.h                       |   4 +
+ src/llama-graph.cpp                       |  45 +-
+ src/llama-graph.h                         |   4 +
+ src/llama-model.h                         |   3 +
+ src/llama-spar.cpp                        | 792 ++++++++++++++++++++++
+ src/llama-spar.h                          | 153 +++++
+ src/models/qwen4exp.cpp                   |  29 +-
+ 26 files changed, 1462 insertions(+), 9 deletions(-)
+ create mode 100644 src/llama-spar.cpp
+ create mode 100644 src/llama-spar.h
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 14d82f6..87d32a6 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1723,6 +1723,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.cache_ram_mib = value;
+         }
+     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
++    add_opt(common_arg(
++        {"--spar-experts"}, "FNAME",
++        "byteplan expert pool: experts.bin of a spar trunk (tools/compiler/spar_pack.py); experts are streamed into a slot pool",
++        [](common_params & params, const std::string & value) {
++            params.spar_experts = value;
++        }
++    ).set_env("LLAMA_ARG_SPAR_EXPERTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_COMMON}));
++    add_opt(common_arg(
++        {"--spar-slots"}, "N",
++        "byteplan expert pool: expert slots per layer kept in RAM (default: 0 = all experts)",
++        [](common_params & params, int value) {
++            params.spar_slots = value;
++        }
++    ).set_env("LLAMA_ARG_SPAR_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_COMMON}));
+     add_opt(common_arg(
+         {"-kvu", "--kv-unified"},
+         {"-no-kvu", "--no-kv-unified"},
+diff --git a/common/common.cpp b/common/common.cpp
+index e36f8ab..ab6194a 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1718,6 +1718,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.op_offload        = !params.no_op_offload;
+     cparams.swa_full          = params.swa_full;
+     cparams.kv_unified        = params.kv_unified;
++    cparams.spar_experts      = params.spar_experts.empty() ? nullptr : params.spar_experts.c_str();
++    cparams.spar_slots        = params.spar_slots;
++    cparams.spar_progress_callback           = params.spar_progress_callback;
++    cparams.spar_progress_callback_user_data = params.spar_progress_callback_user_data;
+ 
+     cparams.type_k = params.cache_type_k;
+     cparams.type_v = params.cache_type_v;
+diff --git a/common/common.h b/common/common.h
+index 3e3eff3..814cdf9 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -577,6 +577,11 @@ struct common_params {
+     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+     bool kv_unified        = false; // enable unified KV cache
+ 
++    std::string spar_experts;        // byteplan expert pool: experts.bin of a spar trunk
++    int32_t     spar_slots    = 0;   // expert slots per layer (0 = all)
++    llama_progress_callback spar_progress_callback = NULL; // preload of the expert pool
++    void *                  spar_progress_callback_user_data = NULL;
++
+     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
+     bool verbose_prompt    = false; // print prompt tokens before generation
+     bool display_prompt    = true;  // print prompt before generation
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 224bdef..ff310eb 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -585,6 +585,7 @@ extern "C" {
+         GGML_OP_DSV4_HC_COMB,
+         GGML_OP_DSV4_HC_PRE,
+         GGML_OP_DSV4_HC_POST,
++        GGML_OP_SPAR,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -1503,6 +1504,15 @@ extern "C" {
+             struct ggml_tensor  * b,
+             struct ggml_tensor  * ids);
+ 
++    // byteplan: like ggml_mul_mat_id, but writes into acc (a previous ggml_mul_mat_id result with the same shapes);
++    // rows whose id is negative are skipped and keep their value (Metal only, used by the spar expert pool)
++    GGML_API struct ggml_tensor * ggml_mul_mat_id_into(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * as,
++            struct ggml_tensor  * b,
++            struct ggml_tensor  * ids,
++            struct ggml_tensor  * acc);
++
+     // A: m columns, n rows,
+     // B: p columns, n rows,
+     // result is m columns, p rows
+@@ -2726,6 +2736,57 @@ extern "C" {
+             struct ggml_tensor  * post,
+             struct ggml_tensor  * comb);
+ 
++    // byteplan expert pool ("spar", Metal only): a CPU thread streams routed experts into a slot pool, the GPU
++    // synchronizes with it through `ctrl`, an I32 control block in a shared buffer (layout in the params below).
++    //   ggml_spar_wait: publishes ids [k, n_tokens] of a layer, then spins (bounded) until the CPU released the layer;
++    //                   returns a 1-element I32 dependency for ggml_spar_map
++    //   ggml_spar_map:  refreshes the slots the CPU refilled (system-coherent) and maps expert ids -> slot ids
++    enum ggml_spar_param {
++        GGML_SPAR_P_MODE,           // bits 0-7: 0 wait, 1 map, 2 hint (set by the constructors); bits 8+: pass
++        GGML_SPAR_P_LAYER,
++        GGML_SPAR_P_OFF_SEQ,        // offsets are in int32 units into ctrl
++        GGML_SPAR_P_OFF_GATE,
++        GGML_SPAR_P_OFF_NTOK,
++        GGML_SPAR_P_OFF_MIRROR,     // + layer * MIRROR_STRIDE
++        GGML_SPAR_P_MIRROR_STRIDE,
++        GGML_SPAR_P_OFF_REMAP,      // + layer * N_EXPERT
++        GGML_SPAR_P_N_EXPERT,
++        GGML_SPAR_P_OFF_REFRESH,    // + layer * REFRESH_STRIDE: [count, slot...]
++        GGML_SPAR_P_REFRESH_STRIDE,
++        GGML_SPAR_P_OFF_HB,         // CPU heartbeat
++        GGML_SPAR_P_OFF_ABORT,
++        GGML_SPAR_P_LIMIT,          // polls without a heartbeat change before giving up
++        GGML_SPAR_P_BLOB_WORDS,     // slot size in uint32 words
++        GGML_SPAR_P_OFF_TIMEOUTS,
++        GGML_SPAR_N_PARAMS,
++    };
++
++    // pass: multi-pass MoE (a layer's experts in groups of S slots), after: optional dependency, the wait runs on the
++    // GPU only once `after` is computed (the previous pass must have finished reading the pool)
++    GGML_API struct ggml_tensor * ggml_spar_wait(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * ids,
++            struct ggml_tensor  * ctrl,
++            const int32_t       * params,
++            int32_t               pass,
++            struct ggml_tensor  * after);
++
++    // hint: publishes predicted expert ids [n, n_tokens] of a later layer (no wait); the CPU prefetches them.
++    // Uses OFF_SEQ/OFF_NTOK/OFF_MIRROR/MIRROR_STRIDE of params as the hint counters and area.
++    GGML_API struct ggml_tensor * ggml_spar_hint(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * ids,
++            struct ggml_tensor  * ctrl,
++            const int32_t       * params);
++
++    GGML_API struct ggml_tensor * ggml_spar_map(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * ids,
++            struct ggml_tensor  * ctrl,
++            struct ggml_tensor  * wait,
++            struct ggml_tensor  * pool,
++            const int32_t       * params);
++
+     // custom operators
+ 
+     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 8ed5f4e..d85523a 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1046,7 +1046,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             } break;
+             case GGML_OP_DSV4_HC_COMB:
+             case GGML_OP_DSV4_HC_PRE:
+-            case GGML_OP_DSV4_HC_POST: {
++            case GGML_OP_DSV4_HC_POST:
++            case GGML_OP_SPAR: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+             } break;
+             case GGML_OP_UNARY: {
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 7c274c0..01dd13d 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2105,6 +2105,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_dsv4_hc_post(params, tensor);
+             } break;
++        case GGML_OP_SPAR:
++            {
++                GGML_ABORT("GGML_OP_SPAR is Metal-only (byteplan expert pool)");
++            }
+         case GGML_OP_MAP_CUSTOM1:
+             {
+                 ggml_compute_forward_map_custom1(params, tensor);
+@@ -2291,6 +2295,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+             {
+                 n_tasks = n_threads;
+             } break;
++        case GGML_OP_SPAR:
++            {
++                n_tasks = 1;
++            } break;
+         case GGML_OP_REPEAT:
+         case GGML_OP_REPEAT_BACK:
+         case GGML_OP_LEAKY_RELU:
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 81ff5d7..ee5f0cf 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -440,6 +440,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+     }
+ 
+     switch (op->op) {
++        case GGML_OP_SPAR:
++            return false; // Metal-only
+         case GGML_OP_CPY:
+         case GGML_OP_SET_ROWS:
+             return
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 198e325..973e6cb 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -508,6 +508,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexe
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_spar(ggml_metal_library_t lib, int32_t mode) {
++    const char * name = (mode & 0xff) == 0 ? "kernel_spar_wait" : (mode & 0xff) == 1 ? "kernel_spar_map" : "kernel_spar_hint";
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_metal_library_t lib, const ggml_tensor * op) {
+     char name[256];
+     const char * base = nullptr;
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 9fe04f1..6629dfa 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -127,6 +127,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_tri
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max          (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc           (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_spar         (ggml_metal_library_t lib, int32_t mode);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv          (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t nc, bool use_silu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched  (ggml_metal_library_t lib, const struct ggml_tensor * op, int ssm_conv_bs, int32_t nc, bool use_silu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op, bool tail);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 827d926..82789c6 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1917,6 +1917,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+                         return false;
+                 };
+             }
++        case GGML_OP_SPAR:
++            return op->src[0]->type == GGML_TYPE_I32;
+         case GGML_OP_GET_ROWS:
+             return op->src[0]->type != GGML_TYPE_NVFP4 &&
+                    op->src[0]->type != GGML_TYPE_TQ1_0;
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index e3e03c1..710b768 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -1345,6 +1345,30 @@ typedef struct {
+     float    gate_scale_out;
+ } ggml_metal_kargs_dsv4_hc_post;
+ 
++// byteplan expert pool (GGML_OP_SPAR); offsets in uint32 units into the control block
++typedef struct {
++    int32_t  layer;
++    int32_t  k;
++    int32_t  n_tokens;
++    uint64_t nb_ids0;
++    uint64_t nb_ids1;
++    int32_t  off_seq;
++    int32_t  off_gate;
++    int32_t  off_ntok;
++    int32_t  off_mirror;
++    int32_t  mirror_stride;
++    int32_t  off_remap;
++    int32_t  n_expert;
++    int32_t  off_refresh;
++    int32_t  refresh_stride;
++    int32_t  off_hb;
++    int32_t  off_abort;
++    int32_t  limit;
++    int32_t  blob_words;
++    int32_t  off_timeouts;
++    int32_t  pass;
++} ggml_metal_kargs_spar;
++
+ typedef struct {
+     int32_t  ne00;
+     int32_t  ne01;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 1ae63df..251f1f9 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -359,6 +359,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+             {
+                 n_fuse = ggml_metal_op_dsv4_hc(ctx, idx);
+             } break;
++        case GGML_OP_SPAR:
++            {
++                n_fuse = ggml_metal_op_spar(ctx, idx);
++            } break;
+         case GGML_OP_SOFT_MAX:
+             {
+                 n_fuse = ggml_metal_op_soft_max(ctx, idx);
+@@ -6063,3 +6067,58 @@ int ggml_metal_op_count_equal(ggml_metal_op_t ctx, int idx) {
+ 
+     return 1;
+ }
++
++// byteplan expert pool: mode 0 waits (one thread, bounded spin), mode 1 refreshes refilled slots and maps ids -> slots
++int ggml_metal_op_spar(ggml_metal_op_t ctx, int idx) {
++    ggml_tensor * op = ctx->node(idx);
++
++    ggml_metal_library_t lib = ctx->lib;
++    ggml_metal_encoder_t enc = ctx->enc;
++
++    const int32_t * p   = (const int32_t *) op->op_params;
++    const ggml_tensor * ids = op->src[0];
++
++    ggml_metal_kargs_spar args = {
++        /*.layer          =*/ p[GGML_SPAR_P_LAYER],
++        /*.k              =*/ (int32_t) ids->ne[0],
++        /*.n_tokens       =*/ (int32_t) ids->ne[1],
++        /*.nb_ids0        =*/ ids->nb[0],
++        /*.nb_ids1        =*/ ids->nb[1],
++        /*.off_seq        =*/ p[GGML_SPAR_P_OFF_SEQ],
++        /*.off_gate       =*/ p[GGML_SPAR_P_OFF_GATE],
++        /*.off_ntok       =*/ p[GGML_SPAR_P_OFF_NTOK],
++        /*.off_mirror     =*/ p[GGML_SPAR_P_OFF_MIRROR],
++        /*.mirror_stride  =*/ p[GGML_SPAR_P_MIRROR_STRIDE],
++        /*.off_remap      =*/ p[GGML_SPAR_P_OFF_REMAP],
++        /*.n_expert       =*/ p[GGML_SPAR_P_N_EXPERT],
++        /*.off_refresh    =*/ p[GGML_SPAR_P_OFF_REFRESH],
++        /*.refresh_stride =*/ p[GGML_SPAR_P_REFRESH_STRIDE],
++        /*.off_hb         =*/ p[GGML_SPAR_P_OFF_HB],
++        /*.off_abort      =*/ p[GGML_SPAR_P_OFF_ABORT],
++        /*.limit          =*/ p[GGML_SPAR_P_LIMIT],
++        /*.blob_words     =*/ p[GGML_SPAR_P_BLOB_WORDS],
++        /*.off_timeouts   =*/ p[GGML_SPAR_P_OFF_TIMEOUTS],
++        /*.pass           =*/ p[GGML_SPAR_P_MODE] >> 8,
++    };
++
++    const int32_t mode = p[GGML_SPAR_P_MODE] & 0xff;
++
++    auto pipeline = ggml_metal_library_get_pipeline_spar(lib, mode);
++
++    ggml_metal_encoder_set_pipeline(enc, pipeline);
++    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids),        1);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
++
++    if (mode == 0 || mode == 2) {
++        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 3);
++        ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 1, 1, 1);
++    } else {
++        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[2]), 3);
++        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[3]), 4);
++        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),         5);
++        ggml_metal_encoder_dispatch_threadgroups(enc, 64, 1, 1, 256, 1, 1);
++    }
++
++    return 1;
++}
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.h b/ggml/src/ggml-metal/ggml-metal-ops.h
+index 07eb8df..72fc7b5 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.h
++++ b/ggml/src/ggml-metal/ggml-metal-ops.h
+@@ -103,6 +103,7 @@ int ggml_metal_op_argsort           (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_top_k             (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_topk_moe          (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_moe_reduce        (ggml_metal_op_t ctx, int idx);
++int ggml_metal_op_spar              (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_tri               (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_opt_step_adamw    (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_opt_step_sgd      (ggml_metal_op_t ctx, int idx);
+diff --git a/ggml/src/ggml-metal/kernels/misc.metal b/ggml/src/ggml-metal/kernels/misc.metal
+index caf8a2b..12b96ef 100644
+--- a/ggml/src/ggml-metal/kernels/misc.metal
++++ b/ggml/src/ggml-metal/kernels/misc.metal
+@@ -778,3 +778,110 @@ kernel void kernel_dsv4_hc_post_f32(
+         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
+     }
+ }
++
++// byteplan expert pool (GGML_OP_SPAR). The GPU and a CPU thread share `ctrl`; plain device loads may hit stale GPU
++// cache lines for CPU-written data, so everything shared is accessed system-coherently (MLX fence.metal pattern).
++// The spin is bounded: without a CPU heartbeat change for `limit` polls the kernel sets `abort` and returns.
++#pragma METAL internals : enable
++#ifndef __METAL_MEMORY_SCOPE_SYSTEM__
++#define __METAL_MEMORY_SCOPE_SYSTEM__ 3
++#endif
++constexpr constant metal::thread_scope spar_thread_scope_system = static_cast<metal::thread_scope>(__METAL_MEMORY_SCOPE_SYSTEM__);
++#define SPAR_FENCE() atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, spar_thread_scope_system)
++
++kernel void kernel_spar_wait(
++        constant ggml_metal_kargs_spar & args,
++        device const char * ids,
++        volatile coherent(system) device uint * ctrl,
++        device int * dst,
++        uint tid [[thread_position_in_grid]]) {
++    if (tid != 0) {
++        return;
++    }
++    // the ids are the same for every pass of a layer: the CPU plans all passes from pass 0
++    if (args.pass == 0) {
++        volatile coherent(system) device uint * mirror = ctrl + args.off_mirror + args.layer*args.mirror_stride;
++        for (int t = 0; t < args.n_tokens; ++t) {
++            for (int j = 0; j < args.k; ++j) {
++                mirror[t*args.k + j] = (uint) *((device const int *) (ids + j*args.nb_ids0 + t*args.nb_ids1));
++            }
++        }
++    }
++    ctrl[args.off_ntok + args.layer] = (uint) args.n_tokens | ((uint) args.pass << 16);
++    SPAR_FENCE();
++    const uint seq = ctrl[args.off_seq + args.layer] + 1;
++    ctrl[args.off_seq + args.layer] = seq;
++    SPAR_FENCE();
++
++    uint hb   = ctrl[args.off_hb];
++    uint idle = 0;
++    while (true) {
++        SPAR_FENCE();
++        if (ctrl[args.off_abort] != 0 || ctrl[args.off_gate + args.layer] >= seq) {
++            break;
++        }
++        const uint h = ctrl[args.off_hb];
++        if (h != hb) {
++            hb   = h;
++            idle = 0;
++        } else if (++idle > (uint) args.limit) {
++            ctrl[args.off_abort]     = 1;
++            ctrl[args.off_timeouts] += 1;
++            SPAR_FENCE();
++            break;
++        }
++    }
++    dst[0] = 0;
++}
++
++// prefetch hint: predicted ids [n, n_tokens] of a later layer into the hint area, then hint seq++ (no waiting)
++kernel void kernel_spar_hint(
++        constant ggml_metal_kargs_spar & args,
++        device const char * ids,
++        volatile coherent(system) device uint * ctrl,
++        device int * dst,
++        uint tid [[thread_position_in_grid]]) {
++    if (tid != 0) {
++        return;
++    }
++    volatile coherent(system) device uint * hint = ctrl + args.off_mirror + args.layer*args.mirror_stride;
++    for (int t = 0; t < args.n_tokens; ++t) {
++        for (int j = 0; j < args.k; ++j) {
++            hint[t*args.k + j] = (uint) *((device const int *) (ids + j*args.nb_ids0 + t*args.nb_ids1));
++        }
++    }
++    ctrl[args.off_ntok + args.layer] = (uint) args.n_tokens | ((uint) args.k << 16);
++    SPAR_FENCE();
++    ctrl[args.off_seq + args.layer] = ctrl[args.off_seq + args.layer] + 1;
++    SPAR_FENCE();
++    dst[0] = 0;
++}
++
++kernel void kernel_spar_map(
++        constant ggml_metal_kargs_spar & args,
++        device const char * ids,
++        volatile coherent(system) device uint * ctrl,
++        device const int * wait,
++        volatile coherent(system) device uint * pool,
++        device int * dst,
++        uint tid  [[thread_position_in_grid]],
++        uint ntid [[threads_per_grid]]) {
++    // re-read the slots the CPU just filled system-coherently and write them back through the GPU caches
++    volatile coherent(system) device uint * list = ctrl + args.off_refresh + args.layer*args.refresh_stride;
++    const uint n = list[0];
++    for (uint r = 0; r < n; ++r) {
++        volatile coherent(system) device uint * p = pool + (ulong) list[1 + r] * (ulong) args.blob_words;
++        for (uint i = tid; i < (uint) args.blob_words; i += ntid) {
++            p[i] = p[i];
++        }
++    }
++    SPAR_FENCE();
++
++    volatile coherent(system) device uint * remap = ctrl + args.off_remap + args.layer*args.n_expert;
++    for (uint i = tid; i < (uint) (args.k*args.n_tokens); i += ntid) {
++        const int t = i / args.k;
++        const int j = i % args.k;
++        const int e = *((device const int *) (ids + j*args.nb_ids0 + t*args.nb_ids1));
++        dst[i] = (int) remap[e];
++    }
++}
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv.metal b/ggml/src/ggml-metal/kernels/mul_mv.metal
+index 0d1069f..926bc82 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv.metal
+@@ -3310,6 +3310,11 @@ kernel void kernel_mul_mv_id(
+ 
+     const int32_t i02 = ((device const int32_t *) (ids + iid1*args.nbi1))[idx];
+ 
++    // byteplan: a negative id skips the row (dst keeps its value), see ggml_mul_mat_id_into
++    if (i02 < 0) {
++        return;
++    }
++
+     const int64_t i11 = idx % args.ne11;
+     const int64_t i12 = iid1;
+ 
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 9bcabdb..523915a 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1084,6 +1084,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "DSV4_HC_COMB",
+     "DSV4_HC_PRE",
+     "DSV4_HC_POST",
++    "SPAR",
+ 
+     "UNARY",
+ 
+@@ -1101,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1199,6 +1200,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "dsv4_hc_comb(mixes, scale, base)",
+     "dsv4_hc_pre(x, weights)",
+     "dsv4_hc_post(x, residual, post, comb)",
++    "spar(ids, ctrl)",
+ 
+     "unary(x)",
+ 
+@@ -1216,7 +1218,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -3424,6 +3426,30 @@ struct ggml_tensor * ggml_mul_mat_id(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_mul_mat_id_into(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * as,
++        struct ggml_tensor  * b,
++        struct ggml_tensor  * ids,
++        struct ggml_tensor  * acc) {
++    struct ggml_tensor * base = acc->view_src ? acc->view_src : acc;
++    GGML_ASSERT(base->op == GGML_OP_MUL_MAT_ID && acc->view_offs == 0 && ggml_are_same_layout(acc, base));
++    GGML_ASSERT(base->src[0]->ne[2] == as->ne[2] && base->src[2]->ne[1] == ids->ne[1]); // same slots, same tokens
++    GGML_ASSERT(!ggml_is_transposed(as) && ids->type == GGML_TYPE_I32 && as->ne[0] == b->ne[0] && ids->ne[1] == b->ne[2]);
++    GGML_ASSERT(acc->ne[0] == as->ne[1] && acc->ne[1] == ids->ne[0] && acc->ne[2] == b->ne[2] && acc->ne[3] == 1);
++
++    // the result aliases acc (like an inplace op); src[3] orders it after the previous writer
++    struct ggml_tensor * result = ggml_view_tensor(ctx, acc);
++
++    result->op     = GGML_OP_MUL_MAT_ID;
++    result->src[0] = as;
++    result->src[1] = b;
++    result->src[2] = ids;
++    result->src[3] = acc;
++
++    return result;
++}
++
+ // ggml_out_prod
+ 
+ static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
+@@ -6617,6 +6643,77 @@ struct ggml_tensor * ggml_dsv4_hc_post(
+     return result;
+ }
+ 
++// ggml_spar_wait / ggml_spar_map (byteplan expert pool)
++
++static void ggml_spar_set_params(struct ggml_tensor * t, const int32_t * params, int32_t mode) {
++    int32_t p[GGML_SPAR_N_PARAMS];
++    memcpy(p, params, sizeof(p));
++    p[GGML_SPAR_P_MODE] = mode;
++    ggml_set_op_params(t, p, sizeof(p));
++}
++
++struct ggml_tensor * ggml_spar_wait(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * ids,
++        struct ggml_tensor  * ctrl,
++        const int32_t       * params,
++        int32_t               pass,
++        struct ggml_tensor  * after) {
++    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[2] == 1 && ids->ne[3] == 1);
++    GGML_ASSERT(ctrl->type == GGML_TYPE_I32);
++    GGML_ASSERT(pass >= 0 && pass < (1 << 15));
++
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
++
++    ggml_spar_set_params(result, params, 0 | (pass << 8));
++    result->op     = GGML_OP_SPAR;
++    result->src[0] = ids;
++    result->src[1] = ctrl;
++    result->src[2] = after;
++
++    return result;
++}
++
++struct ggml_tensor * ggml_spar_hint(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * ids,
++        struct ggml_tensor  * ctrl,
++        const int32_t       * params) {
++    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[2] == 1 && ids->ne[3] == 1);
++    GGML_ASSERT(ctrl->type == GGML_TYPE_I32);
++
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
++
++    ggml_spar_set_params(result, params, 2);
++    result->op     = GGML_OP_SPAR;
++    result->src[0] = ids;
++    result->src[1] = ctrl;
++
++    return result;
++}
++
++struct ggml_tensor * ggml_spar_map(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * ids,
++        struct ggml_tensor  * ctrl,
++        struct ggml_tensor  * wait,
++        struct ggml_tensor  * pool,
++        const int32_t       * params) {
++    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[2] == 1 && ids->ne[3] == 1);
++    GGML_ASSERT(ctrl->type == GGML_TYPE_I32 && wait->op == GGML_OP_SPAR);
++
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
++
++    ggml_spar_set_params(result, params, 1);
++    result->op     = GGML_OP_SPAR;
++    result->src[0] = ids;
++    result->src[1] = ctrl;
++    result->src[2] = wait;
++    result->src[3] = pool;
++
++    return result;
++}
++
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+ struct ggml_hash_set ggml_hash_set_new(size_t size) {
+diff --git a/include/llama.h b/include/llama.h
+index 260247e..f7318c0 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -423,6 +423,13 @@ extern "C" {
+         // a source/target/parent context
+         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
+         struct llama_context * ctx_other;
++
++        // byteplan expert pool for spar trunks (tools/compiler/spar_pack.py): path to experts.bin and slots per
++        // layer (0 = all experts resident)
++        const char * spar_experts;
++        int32_t      spar_slots;
++        llama_progress_callback spar_progress_callback; // preload of the expert pool, 0..1
++        void *                  spar_progress_callback_user_data;
+     };
+ 
+     struct llama_model_tensor_override {
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index afdaddc..09fca91 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -18,6 +18,7 @@ set(LLAMA_CORE_SOURCES
+     llama-cparams.cpp
+     llama-grammar.cpp
+     llama-graph.cpp
++    llama-spar.cpp
+     llama-hparams.cpp
+     llama-impl.cpp
+     llama-io.cpp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 14d0d28..e4e51fb 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -249,6 +249,22 @@ llama_context::llama_context(
+ 
+     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+ 
++    // byteplan expert pool: a spar trunk has no routed experts of its own, experts.bin feeds a slot pool
++    if (params.spar_experts && params.spar_experts[0] && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
++        if (!model.spar_trunk) {
++            throw std::runtime_error("--spar-experts needs a spar trunk (tools/compiler/spar_pack.py), this model has its experts");
++        }
++        const int n_expert = (int) hparams.n_expert;
++        const int n_used   = (int) hparams.n_expert_used();
++        const int n_slots  = params.spar_slots <= 0 ? n_expert : std::min((int) params.spar_slots, n_expert);
++        spar = std::make_unique<llama_spar>(params.spar_experts, (int) hparams.n_layer(), n_expert, (int64_t) hparams.n_embd,
++                                            (int64_t) hparams.n_ff_exp(), n_used, n_slots, (int) cparams.n_ubatch,
++                                            /*load =*/ !model.hparams.no_alloc, params.spar_progress_callback,
++                                            params.spar_progress_callback_user_data);
++    } else if (model.spar_trunk) {
++        throw std::runtime_error("the model is a spar trunk without routed experts: pass the experts file (--spar-experts)");
++    }
++
+     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
+     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
+             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
+@@ -782,6 +798,10 @@ void llama_context::synchronize() {
+ 
+     ggml_backend_sched_synchronize(sched.get());
+ 
++    if (spar) {
++        spar->check();
++    }
++
+     // FIXME: if multiple single tokens are evaluated without a synchronization,
+     // the stats will be added to the prompt evaluation stats
+     // this should only happen when using batch size 1 to evaluate a batch
+@@ -2616,6 +2636,7 @@ llm_graph_params llama_context::graph_params(
+         /*.mctx        =*/ mctx,
+         /*.cross       =*/ &cross,
+         /*.prec_policy =*/ &model.prec_policy,
++        /*.spar        =*/ spar.get(),
+         /*.samplers    =*/ sampling.samplers,
+         /*.n_outputs   =*/ n_outputs,
+         /*.cb          =*/ graph_get_cb(),
+@@ -3872,6 +3893,10 @@ llama_context_params llama_context_default_params() {
+         /*.sampler                     =*/ nullptr,
+         /*.n_sampler                   =*/ 0,
+         /*.ctx_other                   =*/ nullptr,
++        /*.spar_experts                =*/ nullptr,
++        /*.spar_slots                  =*/ 0,
++        /*.spar_progress_callback      =*/ nullptr,
++        /*.spar_progress_callback_user_data =*/ nullptr,
+     };
+ 
+     return result;
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 28d386a..f8fbd19 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -7,6 +7,7 @@
+ #include "llama-adapter.h"
+ #include "llama-impl.h"
+ #include "llama-memory.h"
++#include "llama-spar.h"
+ 
+ #include "ggml-cpp.h"
+ #include "ggml-opt.h"
+@@ -294,6 +295,9 @@ private:
+     llama_cparams cparams;
+ 
+     llama_adapter_cvec_ptr  cvec;
++
++    // byteplan expert pool for spar trunks (nullptr otherwise)
++    std::unique_ptr<llama_spar> spar;
+     llama_adapter_loras_ptr loras;
+ 
+     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1112ad8..1e74a2f 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-graph.h"
++#include "llama-spar.h"
+ 
+ #include "llama-impl.h"
+ #include "llama-model.h"
+@@ -1503,7 +1504,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     n_embd_head_v    (hparams.n_embd_head_v()),
+     n_embd_v_gqa     (hparams.n_embd_v_gqa()),
+     n_expert         (hparams.n_expert),
+-    n_expert_used    (cparams.warmup ? hparams.n_expert : hparams.n_expert_used()),
++    n_expert_used    (cparams.warmup && !params.spar ? hparams.n_expert : hparams.n_expert_used()), // spar: warmup with k experts
+     freq_base        (cparams.rope_freq_base),
+     freq_scale       (cparams.rope_freq_scale),
+     ext_factor       (cparams.yarn_ext_factor),
+@@ -1524,6 +1525,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     mctx             (params.mctx),
+     cross            (params.cross),
+     prec_policy      (params.prec_policy),
++    spar             (params.spar),
+     samplers         (params.samplers),
+     cb_func          (params.cb),
+     res              (params.res),
+@@ -2205,7 +2207,33 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     //call early so that topk-moe can be used
+     ggml_build_forward_expand(gf, weights);
+ 
++    // byteplan expert pool: the expert matmuls read pool slots, so the ids are mapped to slots once the CPU has
++    // loaded every expert this layer needs; scales, biases and router weights keep the expert ids
++    // with fewer slots than the ubatch needs, the code below is pass 0 and further passes follow after the down
++    // projection: each pass loads the next group of experts and fills the rows of its experts (others get id -1)
++    ggml_tensor * ids_mm = selected_experts;
++    int32_t sp[GGML_SPAR_N_PARAMS];
++    int spar_passes = 0;
++    if (spar && spar->has_layer(il)) {
++        GGML_ASSERT(!gate_up_exps && !up_exps_s && !gate_exps_s && !down_exps_s && "spar: unsupported expert layout");
++        spar->params(il, sp);
++        spar_passes = spar->n_pass(il, n_tokens);
++        if (spar_passes > 1) {
++            GGML_ASSERT(type_op == LLM_FFN_SILU && !weight_before_ffn && !up_exps_b && !gate_exps_b && !down_exps_b &&
++                        hparams.swiglu_clamp_exp[il] <= 1e-6f && (!loras || loras->empty()) && "spar: unsupported multi-pass MoE");
++        }
++        ggml_tensor * wait = ggml_spar_wait(ctx0, selected_experts, spar->ctrl, sp, 0, spar_after);
++        spar_after = nullptr;
++        cb(wait, "ffn_moe_spar_wait", il);
++        ids_mm = ggml_spar_map(ctx0, selected_experts, spar->ctrl, wait, spar->slots(ctx0, il), sp);
++        cb(ids_mm, "ffn_moe_slots", il);
++        gate_exps = spar->view(ctx0, il, 0);
++        up_exps   = spar->view(ctx0, il, 1);
++        down_exps = spar->view(ctx0, il, 2);
++    }
++
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
++    ggml_tensor * moe_inp = cur; // spar passes > 0
+ 
+     if (weight_before_ffn) {
+         // repeat cur to [n_embd, n_expert_used, n_tokens]
+@@ -2238,7 +2266,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(up, "ffn_moe_up", il);
+     } else {
+         // separate gate and up path
+-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
++        up = build_lora_mm_id(up_exps, cur, ids_mm, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+         cb(up, "ffn_moe_up", il);
+ 
+         if (up_exps_s) {
+@@ -2251,7 +2279,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         }
+ 
+         if (gate_exps) {
+-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
++            cur = build_lora_mm_id(gate_exps, cur, ids_mm, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+             cb(cur, "ffn_moe_gate", il);
+         } else {
+             cur = up;
+@@ -2352,13 +2380,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             GGML_ABORT("fatal error");
+     }
+ 
+-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
++    experts = build_lora_mm_id(down_exps, cur, ids_mm, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+     if (arch == LLM_ARCH_MISTRAL4) {
+         // src1 can exceed F16 range
+         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
+     }
+     cb(experts, "ffn_moe_down", il);
+ 
++    for (int p = 1; p < spar_passes; ++p) {
++        // the wait follows the previous down projection: the CPU refills slots only after they were read
++        ggml_tensor * wait = ggml_spar_wait(ctx0, selected_experts, spar->ctrl, sp, p, experts);
++        ggml_tensor * ids_p = ggml_spar_map(ctx0, selected_experts, spar->ctrl, wait, spar->slots(ctx0, il), sp);
++        ggml_tensor * act   = ggml_swiglu_split(ctx0, ggml_mul_mat_id(ctx0, gate_exps, moe_inp, ids_p), ggml_mul_mat_id(ctx0, up_exps, moe_inp, ids_p));
++        experts = ggml_mul_mat_id_into(ctx0, down_exps, act, ids_p, experts);
++        cb(experts, "ffn_moe_down_pass", il);
++    }
++
+     if (down_exps_s) {
+         cb(experts, "ffn_moe_down_scaled", il);
+     }
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 8385445..219a0e2 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -796,6 +796,8 @@ struct llm_graph_params {
+ 
+     const llama_prec_policy * prec_policy = nullptr;
+ 
++    const struct llama_spar * spar = nullptr; // byteplan expert pool
++
+     std::map<llama_seq_id, llama_sampler *> samplers;
+ 
+     static bool samplers_equal(
+@@ -1038,6 +1040,8 @@ struct llm_graph_context {
+     const llama_cross            * cross;
+ 
+     const llama_prec_policy * prec_policy;
++    const struct llama_spar * spar;
++    mutable ggml_tensor * spar_after = nullptr; // byteplan: the next spar wait runs after this node (prefetch hint)
+ 
+     std::map<llama_seq_id, llama_sampler *> samplers;
+ 
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 8212447..a83c1e3 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -639,6 +639,9 @@ struct llama_prec_policy {
+ 
+ struct llama_model {
+     llm_type type = LLM_TYPE_UNKNOWN;
++
++    // byteplan: routed experts were moved to experts.bin (tools/compiler/spar_pack.py), served by llama_spar
++    bool spar_trunk = false;
+     llm_arch arch = LLM_ARCH_UNKNOWN;
+ 
+     std::string name = "n/a";
+diff --git a/src/llama-spar.cpp b/src/llama-spar.cpp
+new file mode 100644
+index 0000000..3be5abf
+--- /dev/null
++++ b/src/llama-spar.cpp
+@@ -0,0 +1,792 @@
++#include "llama-spar.h"
++
++#include "llama-impl.h"
++
++#include <algorithm>
++#include <chrono>
++#include <climits>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
++
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++static constexpr size_t SPAR_PAGE = 16384;
++static constexpr float  SPAR_HALF_LIFE = 256.0f; // tokens; best in the trace simulation (agent/code/prose)
++static constexpr char   SPAR_MAGIC[8] = {'B', 'P', 'E', 'X', 'P', 'R', 'T', '1'};
++
++template <typename T> static T rd(const uint8_t *& p) {
++    T v;
++    memcpy(&v, p, sizeof(T));
++    p += sizeof(T);
++    return v;
++}
++
++static void read_full(int fd, void * dst, size_t n, uint64_t off) {
++    auto * d = (char *) dst;
++    while (n > 0) {
++        const ssize_t r = pread(fd, d, n, (off_t) off);
++        if (r <= 0) {
++            throw std::runtime_error(format("spar: pread failed at offset %llu", (unsigned long long) off));
++        }
++        d += r; off += (uint64_t) r; n -= (size_t) r;
++    }
++}
++
++static inline void spar_publish() {
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);
++#if defined(__aarch64__)
++    __asm__ volatile("dsb sy" ::: "memory");
++#endif
++}
++
++void llama_spar::load_header(const std::string & experts_path, int n_layer_model, int n_expert_model, int64_t n_embd, int64_t n_ff) {
++    fd = open(experts_path.c_str(), O_RDONLY);
++    if (fd < 0) {
++        throw std::runtime_error("spar: cannot open " + experts_path);
++    }
++    // ponytail: no page cache. Tried as an elastic second level (a cached read costs 0.06 instead of 0.45 ms, but reads
++    // into the Metal buffer bypass it and a heap bounce copy did): next to the pool and everyday apps macOS kept few
++    // expert pages, +2 % over three sessions for an extra copy per miss. Prefetch hides more (2026-10-09).
++    fcntl(fd, F_NOCACHE, 1);
++
++    std::vector<uint8_t> head(SPAR_PAGE);
++    read_full(fd, head.data(), head.size(), 0);
++    if (memcmp(head.data(), SPAR_MAGIC, 8) != 0) {
++        throw std::runtime_error("spar: " + experts_path + " is not an experts.bin (spar_pack.py)");
++    }
++    const uint8_t * p = head.data() + 8;
++    const uint32_t version = rd<uint32_t>(p);
++    const uint32_t n_lay   = rd<uint32_t>(p);
++    const uint32_t n_exp   = rd<uint32_t>(p);
++    const uint32_t n_mat   = rd<uint32_t>(p);
++    if (version != 1 || n_mat != 3 || n_lay != (uint32_t) n_layer_model || n_exp != (uint32_t) n_expert_model) {
++        throw std::runtime_error(format("spar: experts.bin does not fit the model (version %u, %u matrices, %u layers, %u experts; "
++                                        "model %d layers, %d experts)", version, n_mat, n_lay, n_exp, n_layer_model, n_expert_model));
++    }
++    n_layer  = n_layer_model;
++    n_expert = n_expert_model;
++
++    // every value below sizes a GPU view or a pread: all of them must match the model and stay inside the blob
++    const int64_t want[3][2] = { { n_embd, n_ff }, { n_embd, n_ff }, { n_ff, n_embd } }; // gate, up, down
++    uint64_t end_of_blob = 0;
++    for (int i = 0; i < 3; ++i) {
++        matrix & m = mats[i];
++        const uint32_t type = rd<uint32_t>(p);
++        m.ne0         = (int64_t) rd<uint64_t>(p);
++        m.ne1         = (int64_t) rd<uint64_t>(p);
++        m.slice_bytes = rd<uint64_t>(p);
++        m.offset      = rd<uint64_t>(p);
++        if (type >= GGML_TYPE_COUNT || ggml_type_size((ggml_type) type) == 0 || (i > 0 && type != (uint32_t) mats[0].type) ||
++            m.ne0 != want[i][0] || m.ne1 != want[i][1] || m.ne0 % ggml_blck_size((ggml_type) type) != 0 ||
++            m.slice_bytes != ggml_row_size((ggml_type) type, m.ne0) * (uint64_t) m.ne1 || m.offset != end_of_blob) {
++            throw std::runtime_error(format("spar: experts.bin matrix %d does not fit the model", i));
++        }
++        m.type = (ggml_type) type;
++        end_of_blob = m.offset + m.slice_bytes;
++    }
++    blob_stride = rd<uint64_t>(p);
++    data_offset = rd<uint64_t>(p);
++    // exact values as written by spar_pack.py: no file value can grow the pool size or a read offset
++    if (blob_stride != (end_of_blob + SPAR_PAGE - 1) / SPAR_PAGE * SPAR_PAGE || data_offset != SPAR_PAGE ||
++        (size_t) (p - head.data()) + (size_t) n_layer > head.size()) {
++        throw std::runtime_error("spar: experts.bin has an invalid layout");
++    }
++    present.assign(p, p + n_layer);
++
++    struct stat st = {};
++    if (fstat(fd, &st) != 0 || (uint64_t) st.st_size < data_offset + (uint64_t) n_layer*n_expert*blob_stride) {
++        throw std::runtime_error("spar: experts.bin is truncated");
++    }
++}
++
++bool llama_spar::load_profile(const std::string & path, std::vector<std::vector<float>> & miss, std::vector<std::vector<int>> & rank) const {
++    // a missing or foreign profile only costs speed: fall back to uniform slots and experts 0..S-1
++    FILE * f = fopen(path.c_str(), "rb");
++    if (!f) {
++        return false;
++    }
++    char     magic[8] = {};
++    uint32_t hdr[4]   = {};
++    bool ok = fread(magic, 1, 8, f) == 8 && memcmp(magic, "BPPROF1", 8) == 0 && fread(hdr, 4, 4, f) == 4 &&
++              hdr[0] == 1 && hdr[1] == (uint32_t) n_layer && hdr[2] == (uint32_t) n_expert;
++    miss.assign(n_layer, std::vector<float>(n_expert + 1));
++    rank.assign(n_layer, std::vector<int>(n_expert));
++    std::vector<uint16_t> r(n_expert);
++    std::vector<char>     seen(n_expert);
++    for (int il = 0; ok && il < n_layer; ++il) {
++        ok = fread(miss[il].data(), 4, n_expert + 1, f) == (size_t) n_expert + 1 && fread(r.data(), 2, n_expert, f) == (size_t) n_expert;
++        std::fill(seen.begin(), seen.end(), 0);
++        for (int i = 0; ok && i < n_expert; ++i) {
++            ok = r[i] < n_expert && !seen[r[i]] && std::isfinite(miss[il][i]) && miss[il][i] >= 0.0f;
++            seen[ok ? r[i] : 0] = 1;
++            rank[il][i] = r[i];
++        }
++    }
++    ok = ok && fgetc(f) == EOF;
++    fclose(f);
++    if (!ok) {
++        LLAMA_LOG_WARN("%s: ignoring %s (does not match experts.bin)\n", __func__, path.c_str());
++    }
++    return ok;
++}
++
++void llama_spar::release() {
++    if (buf) {
++        ggml_backend_buffer_free(buf);
++        buf = nullptr;
++    }
++    if (ctx) {
++        ggml_free(ctx);
++        ctx = nullptr;
++    }
++    if (fd >= 0) {
++        close(fd);
++        fd = -1;
++    }
++
++}
++
++llama_spar::llama_spar(const std::string & experts_path, int n_layer_model, int n_expert_model, int64_t n_embd, int64_t n_ff,
++                       int n_expert_used, int n_slots, int n_ubatch, bool load,
++                       llama_progress_callback progress, void * progress_user_data) {
++    try {
++        init(experts_path, n_layer_model, n_expert_model, n_embd, n_ff, n_expert_used, n_slots, n_ubatch, load, progress, progress_user_data);
++    } catch (...) {
++        release(); // the destructor does not run for a throwing constructor
++        throw;
++    }
++}
++
++void llama_spar::init(const std::string & experts_path, int n_layer_model, int n_expert_model, int64_t n_embd, int64_t n_ff,
++                      int n_expert_used, int n_slots_req, int n_ubatch, bool load,
++                      llama_progress_callback progress, void * progress_user_data) {
++    load_header(experts_path, n_layer_model, n_expert_model, n_embd, n_ff);
++
++    n_slots = n_slots_req <= 0 ? n_expert : std::min(n_slots_req, n_expert);
++    k       = n_expert_used;
++    t_max   = n_ubatch;
++    // seq/gate/ntok sit at fixed offsets 64 apart; ntok shares its word with the pass (bits 16+)
++    if (k <= 0 || t_max <= 0 || t_max >= 65536 || n_layer > 64 || n_slots < k) {
++        throw std::runtime_error(format("spar: unsupported setup (%d layers, n_ubatch %d, %d slots for top-%d)", n_layer, n_ubatch, n_slots, k));
++    }
++
++    // optional profile (tools/experts/profile.py): slots per layer by marginal misses saved (steps of 16, floor 48,
++    // total never above n_slots per layer) and the most used experts as the initial working set
++    std::vector<std::vector<float>> miss;
++    std::vector<std::vector<int>>   rank;
++    const bool profiled = n_slots < n_expert && getenv("BYTEPLAN_SPAR_NOPROFILE") == nullptr &&
++                          load_profile(experts_path + ".profile", miss, rank);
++    layer_slots.assign(n_layer, n_slots);
++    if (profiled) {
++        constexpr int step = 16;
++        const int floor_s  = std::min(n_expert, std::max(48, k));
++        int64_t budget = 0, used = 0;
++        for (int il = 0; il < n_layer; ++il) {
++            if (present[il]) {
++                budget += n_slots;
++                layer_slots[il] = floor_s;
++                used += floor_s;
++            }
++        }
++        while (true) {
++            int best = -1;
++            float gain = 0.0f;
++            for (int il = 0; il < n_layer; ++il) {
++                const int s = layer_slots[il];
++                if (present[il] && s + step <= n_expert && used + step <= budget && miss[il][s] - miss[il][s + step] > gain) {
++                    best = il;
++                    gain = miss[il][s] - miss[il][s + step];
++                }
++            }
++            if (best < 0) {
++                break;
++            }
++            layer_slots[best] += step;
++            used += step;
++        }
++    }
++    const int max_slots = *std::max_element(layer_slots.begin(), layer_slots.end());
++
++    // control block layout in uint32 units; the size is checked in 64 bit before anything is allocated
++    const int64_t n_mirror = (int64_t) k * t_max;
++    const int64_t n_hint   = (int64_t) SPAR_HINT_N * SPAR_HINT_T;
++    const int64_t n_ctrl64 = off_remap + (int64_t) n_layer*n_expert + n_layer*(1 + std::min<int64_t>(max_slots, n_mirror)) + n_layer*n_mirror + n_layer*n_hint;
++    if (n_ctrl64 > INT32_MAX) {
++        throw std::runtime_error("spar: control block too large (n_ubatch)");
++    }
++    off_refresh    = off_remap + n_layer*n_expert;
++    refresh_stride = 1 + (int) std::min<int64_t>(max_slots, n_mirror);
++    off_mirror     = off_refresh + n_layer*refresh_stride;
++    mirror_stride  = (int) n_mirror;
++    off_hint       = off_mirror + n_layer*mirror_stride;
++    hint_stride    = (int) n_hint;
++    n_ctrl         = (int) n_ctrl64;
++    // the hint costs ~3 % (an extra router matmul per layer): worth it only with many misses (S=460: +-0, 410: +1 %,
++    // 358: +6 %), so it is on below 85 % slots unless BYTEPLAN_SPAR_PREFETCH=0/1 says otherwise
++    const char * pf_env = getenv("BYTEPLAN_SPAR_PREFETCH");
++    prefetch_on    = max_slots < n_expert && (pf_env ? atoi(pf_env) != 0 : n_slots * 100 < n_expert * 85);
++    if (const char * v = getenv("BYTEPLAN_SPAR_PF_RANKS")) { pf_ranks = std::max(1, atoi(v)); }
++    if (const char * v = getenv("BYTEPLAN_SPAR_PF_MAX"))   { pf_max   = std::max(1, atoi(v)); }
++    if (const char * v = getenv("BYTEPLAN_SPAR_PF_IO"))    { pf_io    = std::max(1, atoi(v)); }
++    if (const char * v = getenv("BYTEPLAN_SPAR_PF_AHEAD")) { pf_ahead = std::clamp(atoi(v), 1, 2); }
++    stats = getenv("BYTEPLAN_SPAR_STATS") != nullptr;
++    const char * lim = getenv("BYTEPLAN_SPAR_LIMIT");
++    limit = lim ? atoi(lim) : 2000000;
++
++    ggml_init_params ip = { ggml_tensor_overhead() * (size_t) (n_layer + 2), nullptr, true };
++    ctx = ggml_init(ip);
++    ctrl = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_ctrl);
++    ggml_set_name(ctrl, "spar_ctrl");
++    pool.assign(n_layer, nullptr);
++    for (int il = 0; il < n_layer; ++il) {
++        if (!present[il]) {
++            continue;
++        }
++        const ggml_type type  = mats[0].type;
++        const size_t    bytes = SPAR_PAGE + (size_t) layer_slots[il] * blob_stride;
++        const int64_t   ne    = (int64_t) ((bytes + ggml_type_size(type) - 1) / ggml_type_size(type)) * ggml_blck_size(type);
++        pool[il] = ggml_new_tensor_1d(ctx, type, ne);
++        ggml_format_name(pool[il], "spar_pool.%d", il);
++    }
++
++    ggml_backend_dev_t gpu = nullptr;
++    for (size_t i = 0; i < ggml_backend_dev_count() && !gpu; ++i) {
++        ggml_backend_dev_t d = ggml_backend_dev_get(i);
++        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
++            gpu = d;
++        }
++    }
++    if (!gpu) {
++        throw std::runtime_error("spar: needs a GPU (Metal) device");
++    }
++    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(gpu));
++    if (!buf) {
++        throw std::runtime_error("spar: pool allocation failed");
++    }
++
++    // the CPU writes the pool and the control block directly: the buffer must be shared (unified memory)
++    memset(ctrl->data, 0, ggml_nbytes(ctrl));
++    *c(off_hb) = 0x5ba5u;
++    int32_t probe = 0;
++    ggml_backend_tensor_get(ctrl, &probe, (size_t) off_hb * sizeof(int32_t), sizeof(probe));
++    if ((uint32_t) probe != 0x5ba5u) {
++        throw std::runtime_error("spar: the GPU buffer is not CPU-visible (needs shared Metal buffers)");
++    }
++    *c(off_hb) = 0;
++
++    pad.assign(n_layer, 0);
++    state.resize(n_layer);
++    served.assign(n_layer, 0);
++    hint_served.assign(n_layer, 0);
++    inflight = std::make_unique<std::atomic<int>[]>(n_layer);
++    done_slots.resize(n_layer);
++    for (int il = 0; il < n_layer; ++il) {
++        if (!pool[il]) {
++            continue;
++        }
++        pad[il] = (SPAR_PAGE - (uintptr_t) pool[il]->data % SPAR_PAGE) % SPAR_PAGE;
++        state[il].slot_of.assign(n_expert, -1);
++        state[il].expert_of.assign(layer_slots[il], -1);
++        state[il].last_use.assign(layer_slots[il], 0);
++        state[il].prefetched.assign(layer_slots[il], 0);
++        state[il].loading.assign(layer_slots[il], 0);
++        state[il].score.assign(n_expert, 0.0f);
++        state[il].score_tok.assign(n_expert, 0);
++    }
++
++    if (!load) {
++        return;
++    }
++
++    // initial working set: the most used experts (profile) or 0..S-1 of every layer, read in parallel
++    const auto t0 = std::chrono::steady_clock::now();
++    std::vector<std::thread> loaders;
++    std::atomic<int>  next{0}, done{0};
++    std::atomic<bool> failed{false};
++    for (int t = 0; t < 8; ++t) {
++        loaders.emplace_back([&] {
++            try {
++                for (int il; !failed && (il = next++) < n_layer; ) {
++                    if (!pool[il]) {
++                        done++;
++                        continue;
++                    }
++                    for (int s = 0; s < layer_slots[il]; ++s) {
++                        const int e = profiled ? rank[il][s] : s;
++                        read_full(fd, slot_ptr(il, s), blob_stride, data_offset + ((uint64_t) il*n_expert + e)*blob_stride);
++                        state[il].slot_of[e]   = s;
++                        state[il].expert_of[s] = e;
++                        *c(off_remap + il*n_expert + e) = (uint32_t) s;
++                    }
++                    done++;
++                }
++            } catch (const std::exception &) {
++                failed = true;
++            }
++        });
++    }
++    // progress for the caller (llama-server shows it while loading), 5 updates per second
++    while (progress && done < n_layer && !failed) {
++        progress((float) done / n_layer, progress_user_data);
++        std::this_thread::sleep_for(std::chrono::milliseconds(200));
++    }
++    for (auto & t : loaders) {
++        t.join();
++    }
++    if (progress) {
++        progress(1.0f, progress_user_data);
++    }
++    if (failed) {
++        throw std::runtime_error("spar: reading the initial experts failed");
++    }
++    spar_publish();
++    const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++    LLAMA_LOG_INFO("%s: %d slots x %d layers (%s, %d..%d per layer, %.2f GiB pool), %s, preload %.1f s\n", __func__, n_slots, n_layer,
++                   profiled ? "profile" : "uniform", *std::min_element(layer_slots.begin(), layer_slots.end()), max_slots,
++                   ggml_backend_buffer_get_size(buf) / 1073741824.0, experts_path.c_str(), dt);
++
++    if (prefetch_on) {
++        for (int t = 0; t < pf_io; ++t) {
++            io_threads.emplace_back([this] { io_loop(); });
++        }
++    }
++    worker = std::thread([this] { run(); });
++}
++
++llama_spar::~llama_spar() {
++    stop = true;
++    if (worker.joinable()) {
++        worker.join();
++    }
++    {
++        std::lock_guard<std::mutex> lock(io_mu);
++        io_q.clear();
++    }
++    io_cv.notify_all();
++    for (auto & t : io_threads) {
++        t.join();
++    }
++    release();
++    LLAMA_LOG_INFO("%s: %llu requests, %llu misses, %.2f GiB read\n", __func__, (unsigned long long) n_requests.load(),
++                   (unsigned long long) n_misses.load(), bytes_read.load() / 1073741824.0);
++    if (stats && n_hint > 0) {
++        LLAMA_LOG_WARN("spar stats: %llu hints, %llu prefetched, %llu of them used, %.3f ms waiting for prefetches\n",
++                       (unsigned long long) n_hint, (unsigned long long) n_prefetch, (unsigned long long) n_prefetch_used,
++                       t_inflight_wait / 1e6);
++    }
++    if (stats && n_requests > 0) {
++        LLAMA_LOG_WARN("spar stats: %llu requests, %llu with misses (%.3f ms each in the worker), %llu misses; "
++                       "per request: plan+victims %.3f ms, io %.3f ms, publish %.3f ms; misses/request 0:%llu 1:%llu 2:%llu 3:%llu 4-7:%llu 8+:%llu\n",
++                       (unsigned long long) n_requests.load(), (unsigned long long) n_req_miss,
++                       n_req_miss ? t_req_miss / 1e6 / n_req_miss : 0.0, (unsigned long long) n_misses.load(),
++                       t_plan / 1e6 / n_requests, t_io / 1e6 / n_requests, t_publish / 1e6 / n_requests,
++                       (unsigned long long) miss_hist[0], (unsigned long long) miss_hist[1], (unsigned long long) miss_hist[2],
++                       (unsigned long long) miss_hist[3], (unsigned long long) miss_hist[4], (unsigned long long) miss_hist[5]);
++    }
++}
++
++bool llama_spar::has_layer(int il) const {
++    return il >= 0 && il < n_layer && pool[il] != nullptr;
++}
++
++void llama_spar::params(int il, int32_t * p) const {
++    p[GGML_SPAR_P_MODE]           = 0;
++    p[GGML_SPAR_P_LAYER]          = il;
++    p[GGML_SPAR_P_OFF_SEQ]        = off_seq;
++    p[GGML_SPAR_P_OFF_GATE]       = off_gate;
++    p[GGML_SPAR_P_OFF_NTOK]       = off_ntok;
++    p[GGML_SPAR_P_OFF_MIRROR]     = off_mirror;
++    p[GGML_SPAR_P_MIRROR_STRIDE]  = mirror_stride;
++    p[GGML_SPAR_P_OFF_REMAP]      = off_remap;
++    p[GGML_SPAR_P_N_EXPERT]       = n_expert;
++    p[GGML_SPAR_P_OFF_REFRESH]    = off_refresh;
++    p[GGML_SPAR_P_REFRESH_STRIDE] = refresh_stride;
++    p[GGML_SPAR_P_OFF_HB]         = off_hb;
++    p[GGML_SPAR_P_OFF_ABORT]      = off_abort;
++    p[GGML_SPAR_P_LIMIT]          = limit;
++    p[GGML_SPAR_P_BLOB_WORDS]     = (int32_t) (blob_stride / 4);
++    p[GGML_SPAR_P_OFF_TIMEOUTS]   = off_timeouts;
++}
++
++ggml_tensor * llama_spar::slots(ggml_context * ctx0, int il) const {
++    const ggml_type type = pool[il]->type;
++    return ggml_view_1d(ctx0, pool[il], (int64_t) ((size_t) layer_slots[il] * blob_stride / ggml_type_size(type)) * ggml_blck_size(type), pad[il]);
++}
++
++bool llama_spar::hint_enabled(int il, int64_t n_tokens) const {
++    return prefetch_on && has_layer(il) && layer_slots[il] < n_expert && n_tokens <= SPAR_HINT_T && n_pass(il, n_tokens) == 1;
++}
++
++void llama_spar::hint_params(int il, int32_t * p) const {
++    params(il, p);
++    p[GGML_SPAR_P_OFF_SEQ]       = off_hint_seq;
++    p[GGML_SPAR_P_OFF_NTOK]      = off_hint_ntok;
++    p[GGML_SPAR_P_OFF_MIRROR]    = off_hint;
++    p[GGML_SPAR_P_MIRROR_STRIDE] = hint_stride;
++}
++
++int llama_spar::n_pass(int il, int64_t n_tokens) const {
++    const int64_t need = std::min<int64_t>((int64_t) k * n_tokens, n_expert);
++    return (int) std::max<int64_t>(1, (need + layer_slots[il] - 1) / layer_slots[il]);
++}
++
++ggml_tensor * llama_spar::view(ggml_context * ctx0, int il, int mat) const {
++    const matrix & m = mats[mat];
++    return ggml_view_3d(ctx0, pool[il], m.ne0, m.ne1, layer_slots[il], ggml_row_size(m.type, m.ne0), blob_stride, pad[il] + m.offset);
++}
++
++void llama_spar::check() const {
++    // no exception: this runs in llama_context::synchronize, also from the destructor and behind the C API
++    if (*c(off_abort) != 0) {
++        GGML_ABORT("spar: the GPU gave up waiting for the expert loader (%u timeouts); the last pass is invalid", *c(off_timeouts));
++    }
++}
++
++char * llama_spar::slot_ptr(int il, int slot) const {
++    return (char *) pool[il]->data + pad[il] + (size_t) slot * blob_stride;
++}
++
++volatile uint32_t * llama_spar::c(int off) const {
++    return (volatile uint32_t *) ctrl->data + off;
++}
++
++float llama_spar::score_now(const layer_state & st, int e) {
++    return st.score[e] * exp2f(-(float) (st.tok - st.score_tok[e]) / SPAR_HALF_LIFE);
++}
++
++void llama_spar::plan(int il, int n_tokens) {
++    auto & st = state[il];
++    volatile uint32_t * ids = c(off_mirror + il*mirror_stride);
++
++    // distinct experts in order of first use; residents first so pass 0 needs the fewest reads
++    static thread_local std::vector<char> seen;
++    seen.assign(n_expert, 0);
++    std::vector<int32_t> resident, missing;
++    st.tok += (uint64_t) n_tokens;
++    for (int i = 0; i < n_tokens*k; ++i) {
++        const uint32_t e = ids[i];
++        if (e >= (uint32_t) n_expert) {
++            throw std::runtime_error(format("spar: layer %d: expert id %u out of range", il, e));
++        }
++        st.score[e]     = score_now(st, (int) e) + 1.0f; // one use per token
++        st.score_tok[e] = st.tok;
++        if (!seen[e]) {
++            seen[e] = 1;
++            (st.slot_of[e] >= 0 ? resident : missing).push_back((int32_t) e);
++        }
++    }
++    st.distinct = resident;
++    st.distinct.insert(st.distinct.end(), missing.begin(), missing.end());
++
++    st.groups.clear();
++    const size_t S = (size_t) layer_slots[il];
++    for (size_t i = 0; i < st.distinct.size(); i += S) {
++        st.groups.emplace_back(st.distinct.begin() + i, st.distinct.begin() + std::min(st.distinct.size(), i + S));
++    }
++    if ((int) st.groups.size() > n_pass(il, n_tokens)) {
++        throw std::runtime_error(format("spar: layer %d: %zu groups but the graph has %d passes", il, st.groups.size(), n_pass(il, n_tokens)));
++    }
++}
++
++void llama_spar::serve(int il, uint32_t seq) {
++    using clk = std::chrono::steady_clock;
++    const auto ns = [](clk::time_point a, clk::time_point b) { return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count(); };
++    const auto t0 = clk::now();
++    auto & st = state[il];
++
++    // finished background prefetches of this layer join this request's refresh list
++    std::vector<int> pending;
++    const auto take_done = [&] {
++        std::lock_guard<std::mutex> lock(io_mu);
++        for (const int s : done_slots[il]) {
++            st.loading[s] = 0;
++            pending.push_back(s);
++        }
++        done_slots[il].clear();
++    };
++    if (prefetch_on) {
++        take_done();
++    }
++    const uint32_t word = *c(off_ntok + il);
++    const int n    = (int) (word & 0xffffu);
++    const int pass = (int) (word >> 16);
++    if (n > t_max || (pass != 0 && pass != st.pass + 1)) {
++        throw std::runtime_error(format("spar: layer %d: invalid request (%d tokens, pass %d after %d)", il, n, pass, st.pass));
++    }
++    st.pass = pass;
++    if (pass == 0) {
++        plan(il, n);
++    }
++    static const std::vector<int32_t> none;
++    const std::vector<int32_t> & group = pass < (int) st.groups.size() ? st.groups[pass] : none;
++
++    // only reads this pass needs are awaited; other prefetches keep running (their slots are never victims)
++    if (prefetch_on) {
++        const auto tw = clk::now();
++        while (true) {
++            if (io_failed) {
++                throw std::runtime_error(format("spar: layer %d: prefetch read failed", il));
++            }
++            bool busy_slot = false;
++            for (const int32_t e : group) {
++                busy_slot = busy_slot || (st.slot_of[e] >= 0 && st.loading[st.slot_of[e]]);
++            }
++            if (!busy_slot) {
++                break;
++            }
++            std::this_thread::yield();
++            take_done();
++        }
++        t_inflight_wait += ns(tw, clk::now());
++    }
++    ++clock;
++
++    // the group is pinned (last_use == clock), victims come only from slots outside it
++    for (const int32_t e : group) {
++        if (st.slot_of[e] >= 0) {
++            st.last_use[st.slot_of[e]] = clock;
++            if (st.prefetched[st.slot_of[e]]) {
++                st.prefetched[st.slot_of[e]] = 0;
++                n_prefetch_used++;
++            }
++        }
++    }
++    std::vector<std::pair<int, int32_t>> jobs; // slot, expert
++    for (const int32_t e : group) {
++        if (st.slot_of[e] >= 0) {
++            continue;
++        }
++        int   victim = -1;
++        float v_score = 0.0f;
++        for (int s = 0; s < layer_slots[il]; ++s) {
++            if (st.last_use[s] == clock || st.loading[s]) {
++                continue; // pinned: part of this pass, or a background read is filling it
++            }
++            const float sc = st.expert_of[s] >= 0 ? score_now(st, st.expert_of[s]) : -1.0f;
++            if (victim < 0 || sc < v_score || (sc == v_score && st.last_use[s] < st.last_use[victim])) {
++                victim  = s;
++                v_score = sc;
++            }
++        }
++        if (victim < 0) {
++            throw std::runtime_error(format("spar: layer %d: no free slot", il));
++        }
++        if (st.expert_of[victim] >= 0) {
++            st.slot_of[st.expert_of[victim]] = -1;
++        }
++        st.slot_of[e]         = victim;
++        st.expert_of[victim]  = e;
++        st.last_use[victim]   = clock;
++        st.prefetched[victim] = 0;
++        jobs.emplace_back(victim, e);
++    }
++
++    const auto t1 = clk::now();
++
++    // parallel reads: one pread per expert, the SSD needs several in flight
++    std::atomic<size_t> next{0};
++    std::atomic<bool>   failed{false};
++    const auto reader = [&] {
++        try {
++            for (size_t j; !failed && (j = next++) < jobs.size(); ) {
++                read_full(fd, slot_ptr(il, jobs[j].first), blob_stride, data_offset + ((uint64_t) il*n_expert + jobs[j].second)*blob_stride);
++                __atomic_fetch_add(const_cast<uint32_t *>(c(off_hb)), 1u, __ATOMIC_RELAXED); // progress: the GPU keeps waiting
++            }
++        } catch (const std::exception &) {
++            failed = true;
++        }
++    };
++    std::vector<std::thread> io;
++    for (size_t t = 1; t < std::min<size_t>(8, jobs.size()); ++t) {
++        io.emplace_back(reader);
++    }
++    reader();
++    for (auto & t : io) {
++        t.join();
++    }
++    if (failed) {
++        throw std::runtime_error(format("spar: layer %d: reading experts failed", il));
++    }
++
++    const auto t2 = clk::now();
++
++    // every expert of the ubatch gets a fresh entry: its slot in this pass or -1 (skipped by MUL_MAT_ID)
++    volatile uint32_t * remap   = c(off_remap + il*n_expert);
++    volatile uint32_t * refresh = c(off_refresh + il*refresh_stride);
++    for (const int32_t e : st.distinct) {
++        remap[e] = 0xffffffffu;
++    }
++    for (const int32_t e : group) {
++        remap[e] = (uint32_t) st.slot_of[e];
++    }
++    // refilled slots: demand reads and finished prefetches, each once
++    static thread_local std::vector<char> listed;
++    listed.assign(layer_slots[il], 0);
++    uint32_t n_refresh = 0;
++    for (const auto & j : jobs) {
++        pending.push_back(j.first);
++    }
++    for (const int s : pending) {
++        if (!listed[s]) {
++            listed[s] = 1;
++            refresh[1 + n_refresh++] = (uint32_t) s;
++        }
++    }
++    refresh[0] = n_refresh;
++
++    spar_publish();
++    *c(off_gate + il) = seq;
++    spar_publish();
++
++    if (stats) {
++        const auto t3 = clk::now();
++        t_plan += ns(t0, t1); t_io += ns(t1, t2); t_publish += ns(t2, t3);
++        miss_hist[jobs.size() >= 8 ? 5 : jobs.size() >= 4 ? 4 : jobs.size()]++;
++        if (!jobs.empty()) {
++            n_req_miss++;
++            t_req_miss += ns(t0, t3);
++        }
++    }
++    n_requests++;
++    n_misses   += jobs.size();
++    bytes_read += jobs.size() * blob_stride;
++}
++
++void llama_spar::prefetch(int il) {
++    auto & st = state[il];
++    const uint32_t word = *c(off_hint_ntok + il);
++    const int T = (int) (word & 0xffffu), N = (int) (word >> 16);
++    if (T <= 0 || T > SPAR_HINT_T || N <= 0 || N > SPAR_HINT_N) {
++        throw std::runtime_error(format("spar: layer %d: invalid hint (%d tokens x %d)", il, T, N));
++    }
++    volatile uint32_t * h = c(off_hint + il*hint_stride);
++    n_hint++;
++
++    // predicted experts that are not resident, best ranks of all tokens first; a few per layer keep the SSD free
++    // for demand reads
++    std::vector<int32_t> want;
++    for (int r = 0; r < std::min(N, pf_ranks) && (int) want.size() < pf_max; ++r) {
++        for (int t = 0; t < T && (int) want.size() < pf_max; ++t) {
++            const uint32_t e = h[t*N + r];
++            if (e >= (uint32_t) n_expert) {
++                throw std::runtime_error(format("spar: layer %d: hint expert id %u out of range", il, e));
++            }
++            if (st.slot_of[e] < 0 && std::find(want.begin(), want.end(), (int32_t) e) == want.end()) {
++                want.push_back((int32_t) e);
++            }
++        }
++    }
++    if (want.empty()) {
++        return;
++    }
++    std::vector<io_job> jobs;
++    for (const int32_t e : want) {
++        int   victim = -1;
++        float v_score = 0.0f;
++        for (int s = 0; s < layer_slots[il]; ++s) {
++            if (st.loading[s]) {
++                continue;
++            }
++            const float sc = st.expert_of[s] >= 0 ? score_now(st, st.expert_of[s]) : -1.0f;
++            if (victim < 0 || sc < v_score || (sc == v_score && st.last_use[s] < st.last_use[victim])) {
++                victim  = s;
++                v_score = sc;
++            }
++        }
++        if (victim < 0) {
++            break;
++        }
++        if (st.expert_of[victim] >= 0) {
++            st.slot_of[st.expert_of[victim]] = -1;
++        }
++        st.slot_of[e]         = victim;
++        st.expert_of[victim]  = e;
++        st.last_use[victim]   = clock;
++        st.loading[victim]    = 1;
++        st.prefetched[victim] = 1;
++        jobs.push_back({ il, victim, e });
++    }
++    inflight[il].fetch_add((int) jobs.size(), std::memory_order_relaxed);
++    {
++        std::lock_guard<std::mutex> lock(io_mu);
++        io_q.insert(io_q.end(), jobs.begin(), jobs.end());
++    }
++    io_cv.notify_all();
++    n_prefetch += jobs.size();
++}
++
++void llama_spar::io_loop() {
++    while (true) {
++        io_job job;
++        {
++            std::unique_lock<std::mutex> lock(io_mu);
++            io_cv.wait(lock, [this] { return stop.load() || !io_q.empty(); });
++            if (io_q.empty()) {
++                return; // stop
++            }
++            job = io_q.front();
++            io_q.pop_front();
++        }
++        try {
++            read_full(fd, slot_ptr(job.il, job.slot), blob_stride, data_offset + ((uint64_t) job.il*n_expert + job.expert)*blob_stride);
++        } catch (const std::exception &) {
++            io_failed = true;
++        }
++        {
++            std::lock_guard<std::mutex> lock(io_mu);
++            done_slots[job.il].push_back(job.slot);
++        }
++        inflight[job.il].fetch_sub(1, std::memory_order_release);
++        __atomic_fetch_add(const_cast<uint32_t *>(c(off_hb)), 1u, __ATOMIC_RELAXED);
++    }
++}
++
++void llama_spar::run() {
++    using clk = std::chrono::steady_clock;
++    auto last_active = clk::now();
++    while (!stop.load(std::memory_order_relaxed)) {
++        bool busy = false;
++        for (int il = 0; il < n_layer; ++il) {
++            if (!pool[il]) {
++                continue;
++            }
++            const uint32_t seq = *c(off_seq + il);
++            if (seq != served[il]) {
++                __atomic_thread_fence(__ATOMIC_ACQUIRE);
++                try {
++                    serve(il, seq);
++                } catch (const std::exception & err) {
++                    LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
++                    *c(off_abort) = 1;
++                }
++                served[il] = seq; // also after an abort, so a failed request is not retried in a loop
++                busy = true;
++            }
++        }
++        for (int il = 0; prefetch_on && il < n_layer; ++il) {
++            const uint32_t hseq = *c(off_hint_seq + il);
++            if (hseq != hint_served[il] && pool[il]) {
++                hint_served[il] = hseq;
++                __atomic_thread_fence(__ATOMIC_ACQUIRE);
++                try {
++                    prefetch(il);
++                } catch (const std::exception & err) {
++                    LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
++                    *c(off_abort) = 1;
++                }
++                busy = true;
++            }
++        }
++        *c(off_hb) = *c(off_hb) + 1; // heartbeat: while this moves the GPU keeps waiting
++        if (busy) {
++            last_active = clk::now();
++        } else if (clk::now() - last_active > std::chrono::milliseconds(50)) {
++            std::this_thread::sleep_for(std::chrono::microseconds(100));
++        }
++    }
++}
+diff --git a/src/llama-spar.h b/src/llama-spar.h
+new file mode 100644
+index 0000000..a81e850
+--- /dev/null
++++ b/src/llama-spar.h
+@@ -0,0 +1,153 @@
++#pragma once
++
++// byteplan expert pool ("spar"): with a spar trunk (tools/compiler/spar_pack.py) the routed experts are not part
++// of the model buffers. They live in experts.bin; a per-layer pool of S slots holds the working set. For every MoE
++// layer the GPU publishes its expert ids and waits (GGML_OP_SPAR, bounded spin) until a CPU thread has loaded the
++// missing experts into slots; then the ids are mapped to slots and the unchanged MUL_MAT_ID kernels run on the pool.
++// Outputs stay bit-identical: same kernels, same data, only the address of an expert changes.
++
++#include "ggml.h"
++#include "llama.h"
++#include "ggml-backend.h"
++
++#include <atomic>
++#include <condition_variable>
++#include <deque>
++#include <memory>
++#include <mutex>
++#include <cstdint>
++#include <string>
++#include <thread>
++#include <vector>
++
++struct llama_spar {
++    // n_layer, n_expert, n_embd, n_ff: the model's shapes, experts.bin must match them
++    // load = false (memory-fit probe): pool and graph tensors only, no preload and no worker
++    llama_spar(const std::string & experts_path, int n_layer, int n_expert, int64_t n_embd, int64_t n_ff,
++               int n_expert_used, int n_slots, int n_ubatch, bool load,
++               llama_progress_callback progress = nullptr, void * progress_user_data = nullptr);
++    ~llama_spar();
++
++    llama_spar(const llama_spar &) = delete;
++    llama_spar & operator=(const llama_spar &) = delete;
++
++    bool has_layer(int il) const;
++
++    // GGML_OP_SPAR parameters of layer il
++    void params(int il, int32_t * p) const;
++
++    // the expert matrix `mat` (0 gate, 1 up, 2 down) of layer il as a [ne0, ne1, S] view into the pool
++    ggml_tensor * view(ggml_context * ctx, int il, int mat) const;
++
++    // the slot area of layer il (starts at the first aligned slot), for the refresh in GGML_OP_SPAR map
++    ggml_tensor * slots(ggml_context * ctx, int il) const;
++
++    // passes MoE layer il needs for n_tokens: the distinct experts of a ubatch go through its slots in groups
++    int n_pass(int il, int64_t n_tokens) const;
++
++    // aborts the process if the GPU gave up waiting: the pass is invalid and the recurrent state with it
++    void check() const;
++
++    // prefetch hint for layer il (decode-sized ubatches): the graph runs layer il's router on the previous layer's
++    // router input and publishes the top SPAR_HINT_N ids with ggml_spar_hint, the worker loads them in the background
++    static constexpr int SPAR_HINT_N = 16;
++    static constexpr int SPAR_HINT_T = 8;
++    bool hint_enabled(int il, int64_t n_tokens) const;
++    void hint_params(int il, int32_t * p) const;
++
++    ggml_tensor * ctrl = nullptr;
++    std::vector<ggml_tensor *> pool; // per layer, nullptr for layers without experts
++
++    int n_slots  = 0;              // requested average slots per layer
++    std::vector<int> layer_slots;  // slots of each layer (same total RAM, more where the profile shows more misses)
++    int n_expert = 0;
++
++private:
++    struct matrix {
++        ggml_type type;
++        int64_t   ne0, ne1;
++        uint64_t  slice_bytes, offset;
++    };
++
++    struct layer_state {
++        std::vector<int32_t>  slot_of;   // expert -> slot or -1
++        std::vector<int32_t>  expert_of; // slot -> expert or -1
++        std::vector<uint64_t> last_use;  // slot -> clock (== clock: pinned for the current pass)
++
++        // eviction by decayed use frequency (LFU with aging, ties by LRU): score halves every SPAR_HALF_LIFE tokens
++        std::vector<float>    score;     // expert -> score at score_tok
++        std::vector<uint64_t> score_tok; // expert -> token count of the layer at the last update
++        uint64_t tok = 0;                // tokens seen by this layer
++
++        // the current ubatch: its distinct experts and their groups, one group per pass
++        std::vector<int32_t>              distinct;
++        std::vector<std::vector<int32_t>> groups;
++        int pass = -1;
++
++        std::vector<char> prefetched; // slot -> filled by a prefetch since the last request (stats)
++        std::vector<char> loading;    // slot -> background read pending
++    };
++
++    void init(const std::string & experts_path, int n_layer_model, int n_expert_model, int64_t n_embd, int64_t n_ff,
++              int n_expert_used, int n_slots_req, int n_ubatch, bool load, llama_progress_callback progress, void * progress_user_data);
++    void load_header(const std::string & experts_path, int n_layer_model, int n_expert_model, int64_t n_embd, int64_t n_ff);
++    bool load_profile(const std::string & path, std::vector<std::vector<float>> & miss, std::vector<std::vector<int>> & rank) const;
++    void release();
++    static float score_now(const layer_state & st, int e);
++    void plan(int il, int n_tokens);
++    void serve(int il, uint32_t seq);
++    void prefetch(int il);
++    void io_loop();
++    void run();
++    char * slot_ptr(int il, int slot) const;
++    volatile uint32_t * c(int off) const;
++
++    int      fd = -1;
++    int      n_layer = 0, k = 0, t_max = 0;
++    matrix   mats[3] = {};
++    uint64_t blob_stride = 0, data_offset = 0;
++    std::vector<uint8_t> present;
++
++    // control block layout (uint32 units)
++    int off_abort = 0, off_timeouts = 1, off_hb = 2, off_seq = 64, off_gate = 128, off_ntok = 192;
++    int off_hint_seq = 256, off_hint_ntok = 320, off_remap = 384;
++    int off_refresh = 0, refresh_stride = 0, off_mirror = 0, mirror_stride = 0, off_hint = 0, hint_stride = 0, n_ctrl = 0;
++    int32_t limit = 0;
++
++    ggml_context *        ctx = nullptr;
++    ggml_backend_buffer_t buf = nullptr;
++    std::vector<size_t>   pad; // per layer, bytes from pool->data to the first 16 KiB aligned slot
++
++    std::vector<layer_state> state;
++    std::vector<uint32_t>    served, hint_served;
++
++    // background reads for prefetch hints; serve() waits for a layer's reads, their slots join its refresh list
++    struct io_job { int il, slot; int32_t expert; };
++    std::mutex                       io_mu;
++    std::condition_variable          io_cv;
++    std::deque<io_job>               io_q;
++    std::vector<std::thread>         io_threads;
++    std::unique_ptr<std::atomic<int>[]> inflight; // per layer
++    std::vector<std::vector<int>>    done_slots;  // per layer, guarded by io_mu
++    std::atomic<bool>                io_failed{false};
++    bool                             prefetch_on = false;
++public:
++    // predicted ranks considered, reads per hint, IO threads, layers ahead (env BYTEPLAN_SPAR_PF_*); measured best at S=358
++    int pf_ranks = 16, pf_max = 8, pf_io = 4, pf_ahead = 1;
++private:
++    uint64_t clock = 0;
++
++    std::thread       worker;
++    std::atomic<bool> stop{false};
++
++public:
++    // statistics (read after the run)
++    std::atomic<uint64_t> n_requests{0}, n_misses{0}, bytes_read{0};
++
++private:
++    // BYTEPLAN_SPAR_STATS=1: worker phase times (ns) and misses per request, printed at the end
++    bool     stats = false;
++    uint64_t t_plan = 0, t_io = 0, t_publish = 0, n_req_miss = 0, t_req_miss = 0;
++    uint64_t miss_hist[6] = {}; // 0, 1, 2, 3, 4-7, 8+ misses per request
++    uint64_t n_hint = 0, n_prefetch = 0, n_prefetch_used = 0, t_inflight_wait = 0;
++};
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 994ac44..7c770b2 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -2,6 +2,7 @@
+ #include "llama-impl.h"
+ #include "llama-memory-hybrid-idx.h"
+ #include "llama-memory-recurrent.h"
++#include "llama-spar.h"
+ 
+ #include <algorithm>
+ #include <cinttypes>
+@@ -179,6 +180,14 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+     const int trunk_flags = nf.trunk;
+     const int mtp_flags   = nf.mtp;
+ 
++    // byteplan spar trunk (tools/compiler/spar_pack.py): no layer has routed experts, they live in experts.bin
++    // (an MTP-only GGUF lacks blk.0 but keeps the experts of its nextn layers)
++    spar_trunk = true;
++    for (uint32_t il = 0; il < hparams.n_layer_all && spar_trunk; ++il) {
++        spar_trunk = ml.get_weight(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il).str().c_str()) == nullptr;
++    }
++    const int exps_flags = spar_trunk ? TENSOR_NOT_REQUIRED : 0;
++
+     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+ 
+     // there is no output_norm: the final hyper-connection mixer carries it
+@@ -273,8 +282,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+         }
+ 
+         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
+-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
+-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
++        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags | exps_flags);
++        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags | exps_flags);
+ 
+         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
+         layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
+@@ -1144,6 +1153,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
+     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
+ 
++    // byteplan spar prefetch: the next layer's router on this layer's router input predicts ~60 % of its experts;
++    // the hint reaches the CPU before this layer waits, so the reads overlap this layer's compute
++    for (int d = spar ? spar->pf_ahead : 0; d >= 1; --d) { // farthest first, the nearer hint is published last
++        if (il + d < n_layer && spar->hint_enabled(il + d, cur->ne[1])) {
++            ggml_tensor * logits = ggml_mul_mat(ctx0, model.layers[il + d].ffn_gate_inp, cur);
++            int32_t hp[GGML_SPAR_N_PARAMS];
++            spar->hint_params(il + d, hp);
++            ggml_tensor * hint = ggml_spar_hint(ctx0, ggml_argsort_top_k(ctx0, logits, llama_spar::SPAR_HINT_N), spar->ctrl, hp);
++            if (spar_after) {
++                hint->src[2] = spar_after; // keep the order of the two hints
++            }
++            spar_after = hint;
++            cb(spar_after, "ffn_moe_spar_hint", il);
++        }
++    }
++
+     ggml_tensor * moe_out =
+         build_moe_ffn(cur,
+             model.layers[il].ffn_gate_inp,
+-- 
+2.53.0
+

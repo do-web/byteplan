@@ -1,0 +1,12 @@
+[project]
+name = "byteplan-compiler"
+version = "0.1.0"
+description = "byteplan -O1 streaming GGUF rewriter (dense-q8)"
+requires-python = ">=3.12,<3.13"
+dependencies = ["gguf"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+gguf = { path = "../../vendor/llama.cpp/gguf-py", editable = true }

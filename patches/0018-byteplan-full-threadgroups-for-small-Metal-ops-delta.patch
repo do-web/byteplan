@@ -1,0 +1,444 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sun, 11 Oct 2026 00:51:40 +0200
+Subject: [PATCH 18/27] byteplan: full threadgroups for small Metal ops,
+ delta-net state read in place
+
+Decode and draft checks ran several Metal kernels with one thread per threadgroup:
+ssm_conv (one threadgroup per channel), unary ops below 32k elements and binary
+row-broadcast ops below 64k elements (one threadgroup per element). They now run
+256 threads per threadgroup with the same per-element arithmetic, so the results
+stay bit-identical (ssm_conv in a verify step: 52 -> 6 us).
+
+ggml_gated_delta_net_ids reads each sequence's initial state from its row of the
+whole state cache (ids from build_rs), like ggml_ssm_scan does for Mamba, so
+qwen4exp no longer gathers a 3 MB state copy per delta-net layer in every graph.
+CPU and Metal implement the ids; without ids nothing changes.
+
+Measured on Qwen3.8-Flash-Next with MTP + n-gram drafts (ABBA, same answers):
+agent work, new code and prose +6 to +7 %, code edits +4 %.
+---
+ ggml/include/ggml.h                           | 13 ++++++
+ ggml/src/ggml-cpu/ops.cpp                     |  4 +-
+ ggml/src/ggml-metal/ggml-metal-device.cpp     |  8 +++-
+ ggml/src/ggml-metal/ggml-metal-ops.cpp        | 15 ++++---
+ ggml/src/ggml-metal/kernels/binbcast.metal    |  9 +++-
+ .../ggml-metal/kernels/gated_delta_net.metal  |  5 ++-
+ ggml/src/ggml-metal/kernels/ssm.metal         | 43 +++++++++++++++++++
+ ggml/src/ggml-metal/kernels/unary.metal       |  6 ++-
+ ggml/src/ggml.c                               | 32 +++++++++++++-
+ src/models/delta-net-base.cpp                 | 10 +++--
+ src/models/models.h                           |  5 ++-
+ src/models/qwen4exp.cpp                       | 12 ++++--
+ 12 files changed, 141 insertions(+), 21 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index ff310eb..81e32fd 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2669,6 +2669,19 @@ extern "C" {
+             struct ggml_tensor  * state,
+             int64_t               K);
+ 
++    // byteplan: like ggml_gated_delta_net, but state holds all cache rows [S_v, S_v, H, n_rows] and
++    // ids (I32 [n_seqs]) picks the row of each sequence, so the initial states need no gather copy
++    GGML_API struct ggml_tensor * ggml_gated_delta_net_ids(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * k,
++            struct ggml_tensor  * v,
++            struct ggml_tensor  * g,
++            struct ggml_tensor  * beta,
++            struct ggml_tensor  * state,
++            struct ggml_tensor  * ids,
++            int64_t               K);
++
+     // DSA lightning indexer
+     //
+     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index c7e7c47..300670f 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11210,7 +11210,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+ 
+         // copy input state into the working buffer and operate in-place
+         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
+-        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
++        // byteplan: with ids (src[6]) the state holds all cache rows and ids picks the row of seq iv3
++        const int64_t is3 = dst->src[6] ? ((const int32_t *) dst->src[6]->data)[iv3] : iv3;
++        const float * s_in = state_in_base + is3 * state_seq_stride + iv1 * S_v * S_v;
+         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+ 
+         // attn output pointer for first token of this (head, seq)
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 973e6cb..7448baf 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -576,7 +576,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(
+         suffix = "_4";
+     }
+ 
+-    snprintf(base, 256, "kernel_ssm_conv_%s_%s%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type), suffix);
++    // byteplan: the _rows kernels run one thread per row (same sums as kernel_ssm_conv_f32_f32(_4))
++    snprintf(base, 256, "kernel_ssm_conv_%s_%s_rows%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type), suffix);
+     snprintf(name, 256, "%s_nc=%d_silu=%d", base, nc, use_silu ? 1 : 0);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+@@ -731,7 +732,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
+     GGML_ASSERT(ne20 % 32 == 0);
+ 
+     snprintf(base, 256, "kernel_gated_delta_net_%s_%d", ggml_type_name(op->src[0]->type), nsg);
+-    snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d", base, ne20, ne30, K);
++    // byteplan: ids (src[6]) pick each sequence's row of the whole state cache
++    const bool ids = op->src[6] != nullptr;
++    snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d_ids=%d", base, ne20, ne30, K, ids ? 1 : 0);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+@@ -740,6 +743,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
+         ggml_metal_cv_set_int16(cv, ne20, FC_GATED_DELTA_NET + 0);
+         ggml_metal_cv_set_int16(cv, ne30, FC_GATED_DELTA_NET + 1);
+         ggml_metal_cv_set_int16(cv, K,    FC_GATED_DELTA_NET + 2);
++        ggml_metal_cv_set_bool (cv, ids,  FC_GATED_DELTA_NET + 3);
+ 
+         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index cb52a36..4576e54 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -935,8 +935,9 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
+ 
+     if (pipeline.cnt) {
+         const int n = pipeline.c4 ? ggml_nelements(dst)/4 : ggml_nelements(dst);
++        const int nth = MIN(256, n);
+ 
+-        ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, 1, 1, 1);
++        ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth - 1)/nth, 1, 1, nth, 1, 1);
+     } else {
+         const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+         const int nth = MIN(args.ne00, nth_max);
+@@ -1758,8 +1759,9 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
+ 
+     const ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(n_fuse > 1 ? ctx->node(idx + n_fuse - 1) : op);
+ 
+-    // Use batched kernel for prefill (ne1 > 1) to reduce threadgroup dispatch overhead
+-    const bool use_batched = (ne1 > 1);
++    // Use batched kernel for prefill to reduce threadgroup dispatch overhead
++    // byteplan: decode and draft checks (up to 16 tokens) use the one-thread-per-row kernel below
++    const bool use_batched = (ne1 > 16);
+ 
+     if (use_batched) {
+         // Determine the smallest power of 2 that's >= ne1, but <= 256
+@@ -1793,7 +1795,8 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
+         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+         ggml_metal_encoder_set_buffer(enc, bid_dst, 3);
+ 
+-        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne1, ne02, 1, 1, 1);
++        const int nth = std::min(256, ne01);
++        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nth - 1)/nth, ne1, ne02, nth, 1, 1);
+     }
+ 
+     if (n_fuse > 1 && ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
+@@ -2073,6 +2076,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), ida++); // state
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst (attn)
+     ggml_metal_encoder_set_buffer  (enc, bid_out,                              ida++); // state_out
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[6] ? op->src[6] : op->src[5]), ida++); // state row ids (byteplan)
+ 
+     const int nsg = pipeline.nsg;
+ 
+@@ -4272,7 +4276,8 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
+ 
+     if (pipeline.cnt) {
+-        ggml_metal_encoder_dispatch_threadgroups(enc, args.ne0, ggml_nrows(op), 1, 1, 1, 1);
++        const int nth = MIN(256, args.ne0);
++        ggml_metal_encoder_dispatch_threadgroups(enc, (args.ne0 + nth - 1)/nth, ggml_nrows(op), 1, nth, 1, 1);
+     } else {
+         const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+ 
+diff --git a/ggml/src/ggml-metal/kernels/binbcast.metal b/ggml/src/ggml-metal/kernels/binbcast.metal
+index 7c7ab9b..89c228e 100644
+--- a/ggml/src/ggml-metal/kernels/binbcast.metal
++++ b/ggml/src/ggml-metal/kernels/binbcast.metal
+@@ -22,8 +22,13 @@ kernel void kernel_bin_fuse_impl(
+ 
+     if (FC_RB) {
+         // row broadcast
+-        const uint i0 = tgpig.y*args.ne00 + tgpig.x;
+-        const uint i1 = FC_CB ? tgpig.x%args.ne10 : tgpig.x;
++        // byteplan: ntg.x threads per threadgroup along the row instead of one (same element math)
++        const uint ix = tgpig.x*ntg.x + tpitg.x;
++        if (ix >= (uint) args.ne0) {
++            return;
++        }
++        const uint i0 = tgpig.y*args.ne00 + ix;
++        const uint i1 = FC_CB ? ix%args.ne10 : ix;
+ 
+         device const T0 * src0_row = (device const T0 *) (src0);
+         device       T  * dst_row  = (device       T  *) (dst);
+diff --git a/ggml/src/ggml-metal/kernels/gated_delta_net.metal b/ggml/src/ggml-metal/kernels/gated_delta_net.metal
+index 5e4861e..04245f9 100644
+--- a/ggml/src/ggml-metal/kernels/gated_delta_net.metal
++++ b/ggml/src/ggml-metal/kernels/gated_delta_net.metal
+@@ -3,6 +3,7 @@
+ constant short FC_gated_delta_net_ne20 [[function_constant(FC_GATED_DELTA_NET + 0)]];
+ constant short FC_gated_delta_net_ne30 [[function_constant(FC_GATED_DELTA_NET + 1)]];
+ constant short FC_gated_delta_net_K    [[function_constant(FC_GATED_DELTA_NET + 2)]];
++constant bool  FC_gated_delta_net_ids  [[function_constant(FC_GATED_DELTA_NET + 3)]]; // byteplan: state rows picked by ids
+ 
+ #if 1
+ template<short NSG>
+@@ -16,6 +17,7 @@ kernel void kernel_gated_delta_net_impl(
+         device const char * s,
+         device       char * dst,
+         device       char * dst_fuse,
++        device const int32_t * ids,
+         uint3 tgpig[[threadgroup_position_in_grid]],
+         uint3 tpitg[[thread_position_in_threadgroup]],
+         uint3   ntg[[threads_per_threadgroup]])  {
+@@ -37,7 +39,8 @@ kernel void kernel_gated_delta_net_impl(
+ 
+     // input state layout [S_v, S_v, H, n_seqs] (s0 only): per-seq stride is H*D.
+     // state is stored transposed: M[i20][is] = S[is][i20], so row i20 is contiguous
+-    const uint state_in_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
++    const uint i23s = FC_gated_delta_net_ids ? (uint) ids[i23] : i23;
++    const uint state_in_base = (i23s*args.ne21 + i21)*S_v*S_v + i20*S_v;
+     device const float * s_ptr = (device const float *) (s) + state_in_base;
+ 
+     float ls[NSG];
+diff --git a/ggml/src/ggml-metal/kernels/ssm.metal b/ggml/src/ggml-metal/kernels/ssm.metal
+index b21c53b..f32e4e5 100644
+--- a/ggml/src/ggml-metal/kernels/ssm.metal
++++ b/ggml/src/ggml-metal/kernels/ssm.metal
+@@ -66,6 +66,49 @@ kernel void kernel_ssm_conv_f32_f32_4(
+     x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
+ }
+ 
++// byteplan: decode and verify (few tokens): one thread per row instead of one threadgroup of 1-2 threads per row;
++// the same sum per output as kernel_ssm_conv_f32_f32(_4), so the results are bit-identical
++template<bool V4>
++kernel void kernel_ssm_conv_f32_f32_rows(
++        constant ggml_metal_kargs_ssm_conv & args,
++        device const  void * src0,
++        device const  void * src1,
++        device       float * dst,
++        uint3 tgpig[[threadgroup_position_in_grid]],
++        uint3 tpitg[[thread_position_in_threadgroup]],
++        uint3   ntg[[threads_per_threadgroup]]) {
++    const int64_t ir = (int64_t) tgpig.x*ntg.x + tpitg.x;
++    const int64_t i2 = tgpig.y;
++    const int64_t i3 = tgpig.z;
++
++    if (ir >= args.ne01) {
++        return;
++    }
++
++    const int64_t nc = FC_ssm_conv_nc;
++
++    device const char * s = (device const char *) src0 + ir*args.nb01 + i2*args.nb00 + i3*args.nb02;
++    device const char * c = (device const char *) src1 + ir*args.nb11;
++    device       float * x = (device float *) ((device char *) dst + ir*args.nb0 + i2*args.nb1 + i3*args.nb2);
++
++    float sumf = 0.0f;
++
++    if (V4) {
++        FOR_UNROLL (int64_t i0 = 0; i0 < nc/4; ++i0) {
++            sumf += dot(((device const float4 *) s)[i0], ((device const float4 *) c)[i0]);
++        }
++    } else {
++        FOR_UNROLL (int64_t i0 = 0; i0 < nc; ++i0) {
++            sumf += ((device const float *) s)[i0] * ((device const float *) c)[i0];
++        }
++    }
++
++    x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
++}
++
++template [[host_name("kernel_ssm_conv_f32_f32_rows")]]   kernel decltype(kernel_ssm_conv_f32_f32_rows<false>) kernel_ssm_conv_f32_f32_rows<false>;
++template [[host_name("kernel_ssm_conv_f32_f32_rows_4")]] kernel decltype(kernel_ssm_conv_f32_f32_rows<true>)  kernel_ssm_conv_f32_f32_rows<true>;
++
+ constant short FC_ssm_conv_bs   [[function_constant(FC_SSM_CONV + 0)]];
+ 
+ // Batched version: each threadgroup processes multiple tokens for better efficiency
+diff --git a/ggml/src/ggml-metal/kernels/unary.metal b/ggml/src/ggml-metal/kernels/unary.metal
+index 55be289..473c5c9 100644
+--- a/ggml/src/ggml-metal/kernels/unary.metal
++++ b/ggml/src/ggml-metal/kernels/unary.metal
+@@ -21,7 +21,11 @@ kernel void kernel_unary_impl(
+     int i0;
+ 
+     if (FC_CNT) {
+-        i0 = tgpig.x;
++        // byteplan: ntg.x threads per threadgroup instead of one (same element math)
++        i0 = tgpig.x*ntg.x + tpitg.x;
++        if (i0 >= args.ne0*args.ne1*args.ne2*args.ne3) {
++            return;
++        }
+ 
+         src0_ptr = (device const T0 *) (src0);
+         dst_ptr  = (device       T  *) (dst);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 523915a..19cef83 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -6398,7 +6398,7 @@ struct ggml_tensor * ggml_solve_tri(
+ 
+ // ggml_gated_delta_net
+ 
+-struct ggml_tensor * ggml_gated_delta_net(
++static struct ggml_tensor * ggml_gated_delta_net_impl(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * q,
+         struct ggml_tensor  * k,
+@@ -6406,6 +6406,7 @@ struct ggml_tensor * ggml_gated_delta_net(
+         struct ggml_tensor  * g,
+         struct ggml_tensor  * beta,
+         struct ggml_tensor  * state,
++        struct ggml_tensor  * ids,
+         int64_t               K) {
+     GGML_ASSERT(ggml_is_contiguous_rows(q));
+     GGML_ASSERT(ggml_is_contiguous_rows(k));
+@@ -6434,7 +6435,7 @@ struct ggml_tensor * ggml_gated_delta_net(
+     GGML_ASSERT(state->ne[0] == S_v);
+     GGML_ASSERT(state->ne[1] == S_v);
+     GGML_ASSERT(state->ne[2] == H);
+-    GGML_ASSERT(state->ne[3] == n_seqs);
++    GGML_ASSERT(state->ne[3] == n_seqs || ids != NULL);
+     GGML_ASSERT(K >= 1);
+     const int64_t state_rows = K * S_v * n_seqs;
+     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
+@@ -6449,10 +6450,37 @@ struct ggml_tensor * ggml_gated_delta_net(
+     result->src[3] = g;
+     result->src[4] = beta;
+     result->src[5] = state;
++    result->src[6] = ids;
+ 
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_gated_delta_net(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * g,
++        struct ggml_tensor  * beta,
++        struct ggml_tensor  * state,
++        int64_t               K) {
++    return ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, NULL, K);
++}
++
++struct ggml_tensor * ggml_gated_delta_net_ids(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * g,
++        struct ggml_tensor  * beta,
++        struct ggml_tensor  * state,
++        struct ggml_tensor  * ids,
++        int64_t               K) {
++    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids) && ids->ne[0] == v->ne[3]);
++    return ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, ids, K);
++}
++
+ // ggml_lightning_indexer
+ 
+ struct ggml_tensor * ggml_lightning_indexer(
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index d21c66c..aa54dc1 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -535,18 +535,21 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+         ggml_tensor *        g,
+         ggml_tensor *        b,
+         ggml_tensor *        s,
+-        int                  il) {
++        int                  il,
++        ggml_tensor *        s_ids) {
+     const auto * mctx_cur   = inp->mctx;
+     const auto   kv_head    = mctx_cur->get_head();
+     const uint32_t mem_size = mctx_cur->get_size();
+ 
+     const int64_t S_v          = s->ne[0];
+     const int64_t H_v          = s->ne[2];
+-    const int64_t n_seqs       = s->ne[3];
++    const int64_t n_seqs       = v->ne[3];
+     const int64_t n_seq_tokens = q->ne[2];
+ 
+     const bool keep = cparams.n_rs_seq > 0;
+ 
++    GGML_ASSERT(keep || s_ids == nullptr);
++
+     if (!keep) {
+         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
+         ggml_tensor * output    = attn_out.first;
+@@ -566,7 +569,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+     const int64_t K = cparams.n_rs_seq + 1;
+ 
+     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
+-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
++    ggml_tensor * gdn_out = s_ids ? ggml_gated_delta_net_ids(ctx0, q, k, v, g, b, s, s_ids, K)
++                                  : ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+     if (n_seq_tokens > 1) {
+         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+     } else {
+diff --git a/src/models/models.h b/src/models/models.h
+index 1ef0c51..a01ccc5 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -88,6 +88,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
+ 
+     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
+     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
++    // byteplan: with s_ids, s holds all cache rows (head_v_dim, head_v_dim, num_v_heads, n_rows) and s_ids picks
++    // each sequence's row, so the initial states are read in place instead of gathered (needs n_rs_seq > 0)
+     ggml_tensor * build_recurrent_attn(
+             llm_graph_input_rs * inp,
+             ggml_tensor *        ssm_states_all,
+@@ -97,7 +99,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
+             ggml_tensor *        g,
+             ggml_tensor *        b,
+             ggml_tensor *        s,
+-            int                  il);
++            int                  il,
++            ggml_tensor *        s_ids = nullptr);
+ };
+ 
+ struct llm_build_rwkv6_base : public llm_graph_context {
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 89c4ff3..8aa2d64 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1078,8 +1078,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
+             conv_kernel_size - 1, conv_channels, il);
+ 
+-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
++    // byteplan: with rollback slots the delta net reads each sequence's state row in place (ids from build_rs),
++    // which skips a gather copy of the whole state (3 MB per layer here) in every graph; same values
++    ggml_tensor * state_ids = nullptr;
++    ggml_tensor * state = cparams.n_rs_seq > 0
++        ? build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs,
++              [&](ggml_context *, ggml_tensor * states, ggml_tensor * ids) { state_ids = ids; return states; })
++        : build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
++    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, state->ne[1]);
+     cb(state, "state_predelta", il);
+ 
+     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+@@ -1132,7 +1138,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+     cb(k_conv, "k_conv_predelta", il);
+     cb(v_conv, "v_conv_predelta", il);
+ 
+-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
++    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il, state_ids);
+ 
+     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+ 
+-- 
+2.53.0
+

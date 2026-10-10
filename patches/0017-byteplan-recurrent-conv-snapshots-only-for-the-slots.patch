@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sat, 10 Oct 2026 20:42:59 +0200
+Subject: [PATCH 17/27] byteplan: recurrent conv snapshots only for the slots a
+ ubatch can roll back
+
+---
+ src/models/delta-net-base.cpp |  8 +++++---
+ src/models/qwen4exp.cpp       | 15 +++++++++------
+ 2 files changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index ad66126..d21c66c 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -501,9 +501,11 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+ 
+         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+ 
+-        for (int64_t t = 1; t <= K; ++t) {
+-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
+-            const int64_t s_slot = K - t;
++        // byteplan: like the SSM snapshots below, only the slots a rollback of this ubatch can read (s < n_seq_tokens)
++        const int64_t n_written = std::min<int64_t>(ubatch.n_seq_tokens, K);
++
++        for (int64_t s_slot = 0; s_slot < n_written; ++s_slot) {
++            const int64_t s_idx = conv_input->ne[0] - conv_states->ne[0] - s_slot;
+ 
+             ggml_tensor * conv_state_last =
+                 ggml_view_3d(ctx0, conv_input,
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 7c770b2..89c4ff3 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1352,22 +1352,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
+     const uint32_t mem_size = mctx_cur->get_size();
+ 
+-    const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
++    // byteplan: a ubatch of n tokens is rolled back by at most n-1 of them (the SSM snapshots stop there too), so
++    // only min(n_rs_seq + 1, n) slots can be read; small decode/verify graphs skip the rest
++    const int64_t n_slots = std::min<int64_t>((int64_t) cparams.n_rs_seq + 1, ubatch.n_seq_tokens);
+ 
+     for (int64_t slot = 0; slot < n_slots; ++slot) {
+-        const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
++        const int64_t s_idx = conv_input->ne[0] - state_cols - slot;
+ 
+         ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+                 state_cols, channels, n_seqs,
+                 conv_input->nb[1], conv_input->nb[2],
+                 ggml_row_size(conv_input->type, s_idx));
+ 
+-        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+-                state_cols * channels, n_seqs,
+-                conv_states_all->nb[1],
++        // byteplan: dst in the shape of tail, so the copy reads the strided view directly (no cont, same values)
++        ggml_tensor * dst = ggml_view_3d(ctx0, conv_states_all,
++                state_cols, channels, n_seqs,
++                ggml_row_size(conv_states_all->type, state_cols), conv_states_all->nb[1],
+                 (slot * mem_size + kv_head) * row_size);
+ 
+-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
++        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
+     }
+ 
+     return conv_input;
+-- 
+2.53.0
+

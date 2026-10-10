@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sun, 11 Oct 2026 12:48:55 +0200
+Subject: [PATCH 24/27] byteplan: Q2_0 dequantizes in half, copies index in 32
+ bits
+
+(q - 1)*d with q in 0..3 is exact in half (d is a half), so the half tiles of the matmul kernels take the half math
+directly: same values, less ALU work in the expert and Q2_0 dense kernels. kernel_cpy computes its destination indices
+in 32 bits when the tensor fits instead of four emulated 64-bit divisions per element. Same hashes; prompt reading
++7.5 %, decode +5 to +11 %.
+---
+ ggml/src/ggml-metal/kernels/dequantize.h   | 22 ++++++++++++++-
+ ggml/src/ggml-metal/kernels/quantize.metal | 33 ++++++++++++++++++----
+ 2 files changed, 48 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/kernels/dequantize.h b/ggml/src/ggml-metal/kernels/dequantize.h
+index 54e00fa..475330a 100644
+--- a/ggml/src/ggml-metal/kernels/dequantize.h
++++ b/ggml/src/ggml-metal/kernels/dequantize.h
+@@ -98,9 +98,29 @@ void dequantize_q1_0_t4(device const block_q1_0 * xb, short il, thread type4 & r
+ template <typename type4x4>
+ void dequantize_q2_0(device const block_q2_0 * xb, short il, thread type4x4 & reg) {
+     device const uint8_t * qs = xb->qs;
+-    const float d = xb->d;
+ 
+     const int byte_offset = il * 4;  // il*16 elements = il*4 bytes (4 elements per byte)
++
++    if (is_same<type4x4, half4x4>::value) {
++        // byteplan: (q - 1)*d with q in 0..3 is exact in half (d is a half), so half math gives the same values
++        const half d = xb->d;
++
++        half4x4 reg_h;
++
++        for (int i = 0; i < 4; i++) {
++            const uint8_t b = qs[byte_offset + i];
++            reg_h[i][0] = ((half)((b >> 0) & 3) - 1.0h) * d;
++            reg_h[i][1] = ((half)((b >> 2) & 3) - 1.0h) * d;
++            reg_h[i][2] = ((half)((b >> 4) & 3) - 1.0h) * d;
++            reg_h[i][3] = ((half)((b >> 6) & 3) - 1.0h) * d;
++        }
++
++        reg = (type4x4) reg_h;
++        return;
++    }
++
++    const float d = xb->d;
++
+     float4x4 reg_f;
+ 
+     for (int i = 0; i < 4; i++) {
+diff --git a/ggml/src/ggml-metal/kernels/quantize.metal b/ggml/src/ggml-metal/kernels/quantize.metal
+index facb331..219179f 100644
+--- a/ggml/src/ggml-metal/kernels/quantize.metal
++++ b/ggml/src/ggml-metal/kernels/quantize.metal
+@@ -19,12 +19,33 @@ kernel void kernel_cpy_t_t(
+         return;
+     }
+ 
+-    const int64_t n = i03*args.ne02*args.ne01*args.ne00 + i02*args.ne01*args.ne00 + i01*args.ne00;
+-
+-    const int32_t i3 = n/(args.ne2*args.ne1*args.ne0);
+-    const int32_t i2 = (n - i3*args.ne2*args.ne1*args.ne0)/(args.ne1*args.ne0);
+-    const int32_t i1 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0)/args.ne0;
+-    const int32_t i0 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0 - i1*args.ne0);
++    int32_t i3, i2, i1, i0;
++
++    if ((int64_t) args.ne3*args.ne2*args.ne1*args.ne0 <= INT_MAX) {
++        // byteplan: 32-bit index math when the tensor fits (the 64-bit divisions are emulated), same indices
++        const uint32_t ne00  = args.ne00;
++        const uint32_t ne0   = args.ne0;
++        const uint32_t ne10  = (uint32_t) args.ne1*ne0;
++        const uint32_t ne210 = (uint32_t) args.ne2*ne10;
++
++        const uint32_t n = ((uint32_t) i03*(uint32_t) args.ne02 + (uint32_t) i02)*(uint32_t) args.ne01*ne00 + (uint32_t) i01*ne00;
++
++        const uint32_t u3 = n/ne210;
++        const uint32_t u2 = (n - u3*ne210)/ne10;
++        const uint32_t u1 = (n - u3*ne210 - u2*ne10)/ne0;
++
++        i3 = u3;
++        i2 = u2;
++        i1 = u1;
++        i0 = n - u3*ne210 - u2*ne10 - u1*ne0;
++    } else {
++        const int64_t n = i03*args.ne02*args.ne01*args.ne00 + i02*args.ne01*args.ne00 + i01*args.ne00;
++
++        i3 = n/(args.ne2*args.ne1*args.ne0);
++        i2 = (n - i3*args.ne2*args.ne1*args.ne0)/(args.ne1*args.ne0);
++        i1 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0)/args.ne0;
++        i0 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0 - i1*args.ne0);
++    }
+ 
+     device T1 * dst_data = (device T1 *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0);
+ 
+-- 
+2.53.0
+

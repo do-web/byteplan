@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sat, 10 Oct 2026 11:07:10 +0200
+Subject: [PATCH 01/27] byteplan: refusal projection hook for qwen4exp (env
+ BYTEPLAN_REFUSAL_PROJ, default off)
+
+Runtime projection h -= s*(h.v)*v at the output of layers 4..44 on all four hyper-connection
+streams, ported from Cudecnik's qwen4exp control-vector hooks (MIT). Without the environment
+variable the graph is unchanged.
+---
+ src/llama-adapter.cpp   | 86 +++++++++++++++++++++++++++++++++++++++++
+ src/llama-adapter.h     |  9 +++++
+ src/llama-context.cpp   | 10 +++++
+ src/models/qwen4exp.cpp |  3 ++
+ 4 files changed, 108 insertions(+)
+
+diff --git a/src/llama-adapter.cpp b/src/llama-adapter.cpp
+index df3654d..d684d51 100644
+--- a/src/llama-adapter.cpp
++++ b/src/llama-adapter.cpp
+@@ -4,9 +4,14 @@
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ 
++#include <algorithm>
+ #include <map>
+ #include <cassert>
+ #include <cerrno>
++#include <cinttypes>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <sstream>
+ #include <stdexcept>
+@@ -23,6 +28,14 @@ ggml_tensor * llama_adapter_cvec::tensor_for(int il) const {
+ 
+ ggml_tensor * llama_adapter_cvec::apply_to(ggml_context * ctx, ggml_tensor * cur, int  il) const {
+     ggml_tensor * layer_dir = tensor_for(il);
++    if (layer_dir != nullptr && is_projection()) {
++        // h -= s * (h . v) * v for every column of cur (tokens, and the hc streams of qwen4exp)
++        ggml_tensor * hv = ggml_mul_mat(ctx, layer_dir, cur);
++        if (proj_scale != 1.0f) {
++            hv = ggml_scale(ctx, hv, proj_scale);
++        }
++        return ggml_sub(ctx, cur, ggml_mul(ctx, ggml_repeat(ctx, layer_dir, cur), hv));
++    }
+     if (layer_dir != nullptr) {
+         cur = ggml_add(ctx, cur, layer_dir);
+     }
+@@ -30,6 +43,79 @@ ggml_tensor * llama_adapter_cvec::apply_to(ggml_context * ctx, ggml_tensor * cur
+     return cur;
+ }
+ 
++void llama_adapter_cvec::load_projection_env(const llama_model & model) {
++    const char * path = getenv("BYTEPLAN_REFUSAL_PROJ");
++    if (path == nullptr || *path == '\0') {
++        return;
++    }
++    const char * scale_s  = getenv("BYTEPLAN_REFUSAL_SCALE");
++    const char * layers_s = getenv("BYTEPLAN_REFUSAL_LAYERS");
++    const int64_t n_embd  = model.hparams.n_embd;
++    const int     il_last = (int) model.hparams.n_layer() - 1;
++
++    float scale = 1.0f;
++    char  rest  = 0;
++    if (scale_s && (sscanf(scale_s, "%f%c", &scale, &rest) != 1 || !std::isfinite(scale))) {
++        throw std::runtime_error(format("BYTEPLAN_REFUSAL_SCALE: not a finite number: '%s'", scale_s));
++    }
++    if (scale == 0.0f) {
++        LLAMA_LOG_WARN("%s: BYTEPLAN_REFUSAL_SCALE=0, refusal projection off\n", __func__);
++        return;
++    }
++    int il0 = 4, il1 = 44;
++    if (layers_s && (sscanf(layers_s, "%d-%d%c", &il0, &il1, &rest) != 2 || il0 < 1 || il1 < il0)) {
++        throw std::runtime_error(format("BYTEPLAN_REFUSAL_LAYERS: expected 'first-last' with 1 <= first <= last, got '%s'", layers_s));
++    }
++    if (il0 > il_last) {
++        throw std::runtime_error(format("BYTEPLAN_REFUSAL_LAYERS: no layer of %d..%d in this model (layers 1..%d)", il0, il1, il_last));
++    }
++    il1 = std::min(il1, il_last);
++
++    ggml_context * ctx_data = nullptr;
++    gguf_context_ptr ctx_gguf { gguf_init_from_file(path, { /*.no_alloc =*/ false, /*.ctx =*/ &ctx_data }) };
++    ggml_context_ptr ctx_ptr { ctx_data };
++    if (!ctx_gguf) {
++        throw std::runtime_error(format("BYTEPLAN_REFUSAL_PROJ: cannot read GGUF '%s'", path));
++    }
++    const int64_t kid = gguf_find_key(ctx_gguf.get(), "controlvector.model_hint");
++    const std::string hint = kid >= 0 && gguf_get_kv_type(ctx_gguf.get(), kid) == GGUF_TYPE_STRING ? gguf_get_val_str(ctx_gguf.get(), kid) : "";
++    if (hint != llm_arch_name(model.arch)) {
++        throw std::runtime_error(format("BYTEPLAN_REFUSAL_PROJ: %s has controlvector.model_hint '%s', the model is '%s'", path, hint.c_str(), llm_arch_name(model.arch)));
++    }
++
++    // same layout as common_control_vector_load: direction.<il> lands at [n_embd * (il - 1)], used after layer il
++    std::vector<float> data(n_embd * il_last, 0.0f);
++    for (int il = il0; il <= il1; il++) {
++        const std::string name = "direction." + std::to_string(il);
++        const ggml_tensor * t = ggml_get_tensor(ctx_data, name.c_str());
++        if (t == nullptr) {
++            throw std::runtime_error(format("BYTEPLAN_REFUSAL_PROJ: %s has no tensor %s (layers %d..%d)", path, name.c_str(), il0, il1));
++        }
++        if (t->type != GGML_TYPE_F32 || ggml_nelements(t) != n_embd || ggml_n_dims(t) != 1) {
++            throw std::runtime_error(format("BYTEPLAN_REFUSAL_PROJ: %s in %s is %s with %" PRId64 " elements in %d dims, the model needs f32 [%" PRId64 "] (n_embd)",
++                    name.c_str(), path, ggml_type_name(t->type), ggml_nelements(t), ggml_n_dims(t), n_embd));
++        }
++        const float * src = (const float *) t->data;
++        double norm = 0.0;
++        for (int64_t i = 0; i < n_embd; i++) {
++            norm += (double) src[i] * src[i];
++        }
++        norm = sqrt(norm);
++        if (!(norm > 0.0) || !std::isfinite(norm)) {
++            throw std::runtime_error(format("BYTEPLAN_REFUSAL_PROJ: %s has norm %g", name.c_str(), norm));
++        }
++        for (int64_t i = 0; i < n_embd; i++) {
++            data[n_embd * (il - 1) + i] = (float) (src[i] / norm);
++        }
++    }
++
++    if (!apply(model, data.data(), data.size(), n_embd, il0, il1)) {
++        throw std::runtime_error("BYTEPLAN_REFUSAL_PROJ: failed to upload the directions");
++    }
++    proj_scale = scale;
++    LLAMA_LOG_WARN("%s: refusal projection h -= %g * (h . v) * v, layers %d..%d, %s\n", __func__, scale, il0, il1, path);
++}
++
+ bool llama_adapter_cvec::init(const llama_model & model) {
+     const auto & hparams = model.hparams;
+ 
+diff --git a/src/llama-adapter.h b/src/llama-adapter.h
+index f0b1e50..ec979ea 100644
+--- a/src/llama-adapter.h
++++ b/src/llama-adapter.h
+@@ -27,12 +27,21 @@ struct llama_adapter_cvec {
+             int32_t il_start,
+             int32_t il_end);
+ 
++    // byteplan: load BYTEPLAN_REFUSAL_PROJ (+ _SCALE, _LAYERS) and switch to projection mode;
++    // no-op when unset, throws on invalid input
++    void load_projection_env(const llama_model & model);
++
++    bool is_projection() const { return proj_scale != 0.0f; }
++
+ private:
+     bool init(const llama_model & model);
+ 
+     int32_t layer_start = -1;
+     int32_t layer_end   = -1;
+ 
++    // != 0: h -= proj_scale * (h . v) * v with unit v per layer, instead of the additive h += v
++    float proj_scale = 0.0f;
++
+     std::vector<ggml_context_ptr> ctxs;
+     std::vector<ggml_backend_buffer_ptr> bufs;
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index ff2ea46..14d0d28 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -397,6 +397,11 @@ llama_context::llama_context(
+         };
+ 
+         memory.reset(model.create_memory(params_mem, cparams));
++
++        // MTP graph has no build_cvec
++        if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
++            cvec->load_projection_env(model);
++        }
+     }
+ 
+     // init backends
+@@ -1397,6 +1402,11 @@ bool llama_context::set_adapter_cvec(
+                 int32_t   il_end) {
+     LLAMA_LOG_DEBUG("%s: il_start = %d, il_end = %d\n", __func__, il_start, il_end);
+ 
++    if (cvec->is_projection()) {
++        LLAMA_LOG_ERROR("%s: BYTEPLAN_REFUSAL_PROJ is set, a control vector cannot be used with it\n", __func__);
++        return false;
++    }
++
+     bool res = cvec->apply(model, data, len, n_embd, il_start, il_end);
+ 
+     sched_need_reserve = true;
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 88e2e88..994ac44 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -493,6 +493,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+ 
+         res_hc = build_hc_combine(res_hc, cur, inject, il);
+ 
++        // control vector on every hc stream; no-op unless one is loaded
++        res_hc = build_cvec(res_hc, il);
++
+         // "l_last" is the layer output name that build_cvec and imatrix look for
+         cb(res_hc, "l_last", il);
+     }
+-- 
+2.53.0
+

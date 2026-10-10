@@ -1,0 +1,19 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: brew install shellcheck && shellcheck -S warning install.sh bin/chat bin/run-guarded tools/fetch_models.sh
+      - name: guard tests
+        run: bash bin/test-run-guarded.sh --no-smoke
+      - name: patches apply on the pinned llama.cpp
+        run: |
+          rev=$(sed -n 's/^LLAMA_SHA=//p' install.sh)
+          git init -q /tmp/llama && cd /tmp/llama
+          git fetch -q --depth 1 https://github.com/ggml-org/llama.cpp "$rev" && git checkout -q FETCH_HEAD
+          git -c user.name=ci -c user.email=ci@localhost am -q $(sed "s|^|$GITHUB_WORKSPACE/patches/|" "$GITHUB_WORKSPACE/patches/series")
+      - name: python syntax
+        run: python3 -m py_compile tools/compiler/*.py tools/experts/*.py tools/bench/*.py && python3 tools/test_run.py

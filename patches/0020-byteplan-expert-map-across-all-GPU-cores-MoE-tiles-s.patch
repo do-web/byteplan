@@ -1,0 +1,411 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dominik Weber <doweb85@gmail.com>
+Date: Sun, 11 Oct 2026 10:34:23 +0200
+Subject: [PATCH 20/27] byteplan: expert map across all GPU cores, MoE tiles
+ skip empty 8-token rows
+
+kernel_mul_mm_id_map0 ran as one threadgroup scanning every token on one GPU core; it now counts each expert's rows per
+chunk of 32 tokens (map0_cnt) and writes them after the rows of the earlier chunks, one threadgroup per chunk - the same
+lists in the same order. kernel_mul_mm_id gives each simdgroup 8 token rows of the tile (all 64 weight rows), so a
+simdgroup without rows of the expert skips its MMAs; each output element sees the same MMA sequence as before.
+test-backend-ops: qwen4exp expert and QSA attention perf shapes, a QSA-budget sparse attention test.
+---
+ ggml/src/ggml-metal/ggml-metal-device.cpp |   7 +-
+ ggml/src/ggml-metal/ggml-metal-device.h   |   2 +-
+ ggml/src/ggml-metal/ggml-metal-impl.h     |   3 +
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    |  47 +++++---
+ ggml/src/ggml-metal/kernels/mul_mm.metal  | 132 +++++++++++++++-------
+ tests/test-backend-ops.cpp                |  17 +++
+ 6 files changed, 149 insertions(+), 59 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 7448baf..3ef6d72 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -1275,11 +1275,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax(g
+     return res;
+ }
+ 
+-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20) {
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20, bool cnt) {
+     char base[256];
+     char name[256];
+ 
+-    snprintf(base, 256, "kernel_mul_mm_id_map0_ne20_%d", ne20);
++    snprintf(base, 256, "kernel_mul_mm_id_map0%s_ne20_%d", cnt ? "_cnt" : "", ne20);
+     snprintf(name, 256, "%s_ne02=%d", base, ne02);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+@@ -1287,7 +1287,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(g
+         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+     }
+ 
+-    res.smem = (size_t) ne02*ne20*sizeof(uint16_t);
++    // byteplan: the ids of one chunk (map0) or one counter per expert (map0_cnt, also covers the tile sums of map0)
++    res.smem = MAX((size_t) N_MM_ID_MAP_CHUNK*ne20*sizeof(uint16_t), (size_t) ne02*sizeof(uint32_t));
+     res.smem = GGML_PAD(res.smem, 16);
+ 
+     return res;
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 6629dfa..7293116 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -140,7 +140,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mm
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma_auto   (ggml_metal_library_t lib, const struct ggml_tensor * op, bool add);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20, bool cnt);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax(ggml_metal_library_t lib);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax_part(ggml_metal_library_t lib);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index 710b768..c13af2c 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -16,6 +16,9 @@
+ 
+ #define N_MM_NPART_AMAX 256
+ 
++// byteplan: tokens per threadgroup of the mul_mm_id expert map
++#define N_MM_ID_MAP_CHUNK 32
++
+ // kernel parameters for mat-vec threadgroups
+ //
+ // N_R0: number of src0 rows to process per simdgroup
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 4576e54..2443c44 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2835,8 +2835,11 @@ size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {
+ 
+     const int64_t ne02 = op->src[0]->ne[2]; // n_expert
+ 
+-    // byteplan: tokens per expert, then the first compact tile of each expert and the tile count
+-    return ggml_type_size(GGML_TYPE_I32)*(2*ne02 + 1);
++    const int64_t ne21 = op->src[2]->ne[1]; // n_token
++
++    // byteplan: tokens per expert, then the first compact tile of each expert and the tile count, then the rows of
++    // each expert per map chunk
++    return ggml_type_size(GGML_TYPE_I32)*(2*ne02 + 1 + (ne21 + N_MM_ID_MAP_CHUNK - 1)/N_MM_ID_MAP_CHUNK*ne02);
+ }
+ 
+ size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
+@@ -2953,26 +2956,39 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+                 nb21,
+             };
+ 
+-            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20);
++            // byteplan: count, then write, one threadgroup per chunk of tokens (see kernel_mul_mm_id_map0_cnt)
++            ggml_metal_buffer_id bid_cnt = bid_tpe;
++            bid_cnt.offs += ggml_type_size(GGML_TYPE_I32)*(2*ne02 + 1);
+ 
+-            const size_t smem = pipeline.smem;
++            const int nch = (ne21 + N_MM_ID_MAP_CHUNK - 1)/N_MM_ID_MAP_CHUNK;
+ 
+-            GGML_ASSERT(ne02 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
++            for (bool cnt : { true, false }) {
++                auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20, cnt);
+ 
+-            GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
++                const size_t smem = pipeline.smem;
+ 
+-            ggml_metal_encoder_set_pipeline(enc, pipeline);
+-            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+-            ggml_metal_encoder_set_buffer  (enc, bid_src2, 1);
+-            ggml_metal_encoder_set_buffer  (enc, bid_tpe,  2);
+-            ggml_metal_encoder_set_buffer  (enc, bid_ids,  3);
++                GGML_ASSERT(ne02 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+ 
+-            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
++                GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
+ 
+-            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ne02, 1, 1);
+-        }
++                ggml_metal_encoder_set_pipeline(enc, pipeline);
++                ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++                ggml_metal_encoder_set_buffer  (enc, bid_src2, 1);
++                if (cnt) {
++                    ggml_metal_encoder_set_buffer(enc, bid_cnt, 2);
++                } else {
++                    ggml_metal_encoder_set_buffer(enc, bid_tpe, 2);
++                    ggml_metal_encoder_set_buffer(enc, bid_ids, 3);
++                    ggml_metal_encoder_set_buffer(enc, bid_cnt, 4);
++                }
+ 
+-        ggml_metal_op_concurrency_reset(ctx);
++                ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
++
++                ggml_metal_encoder_dispatch_threadgroups(enc, nch, 1, 1, ne02, 1, 1);
++
++                ggml_metal_op_concurrency_reset(ctx);
++            }
++        }
+ 
+         if (use_amax) {
+             auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_amax(lib);
+@@ -4049,6 +4065,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+             nqptg = cfg.Q;  // = 1
+         }
+ 
++
+         const int32_t ns10 = nb11_attn/nb10_attn;
+         const int32_t ns20 = nb21_attn/nb20_attn;
+ 
+diff --git a/ggml/src/ggml-metal/kernels/mul_mm.metal b/ggml/src/ggml-metal/kernels/mul_mm.metal
+index 544399d..6d1162c 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mm.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mm.metal
+@@ -360,59 +360,100 @@ kernel void kernel_mul_mm(
+ 
+ #endif // GGML_METAL_HAS_TENSOR
+ 
++// byteplan: the expert map runs as one threadgroup per chunk of N_MM_ID_MAP_CHUNK tokens instead of a single
++// threadgroup scanning all tokens on one GPU core: map0_cnt counts the rows of each expert per chunk, map0 writes
++// them after the rows of the earlier chunks - the same lists in the same order
++template<short ne20> // n_expert_used
++kernel void kernel_mul_mm_id_map0_cnt(
++        constant ggml_metal_kargs_mul_mm_id_map0 & args,
++        device  const char * src2,
++        device        char * hcnt,
++        threadgroup   char * shmem [[threadgroup(0)]],
++        uint   tgpig[[threadgroup_position_in_grid]],
++        ushort tpitg[[thread_position_in_threadgroup]],
++        ushort   ntg[[threads_per_threadgroup]]) {
++    threadgroup atomic_uint * hist = (threadgroup atomic_uint *) shmem;
++
++    atomic_store_explicit(&hist[tpitg], 0u, memory_order_relaxed);
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    const int t0 = tgpig*N_MM_ID_MAP_CHUNK;
++    const int nt = min(N_MM_ID_MAP_CHUNK, args.ne21 - t0);
++
++    for (int j = tpitg; j < nt*ne20; j += ntg) {
++        // same truncation as the uint16_t ids in map0
++        const uint16_t e = (uint16_t) ((device const int32_t *) (src2 + (t0 + j/ne20)*args.nb21))[j%ne20];
++        if (e < args.ne02) {
++            atomic_fetch_add_explicit(&hist[e], 1u, memory_order_relaxed);
++        }
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    ((device uint32_t *) hcnt)[tgpig*args.ne02 + tpitg] = atomic_load_explicit(&hist[tpitg], memory_order_relaxed);
++}
++
+ template<short ne20> // n_expert_used
+ kernel void kernel_mul_mm_id_map0(
+         constant ggml_metal_kargs_mul_mm_id_map0 & args,
+         device  const char * src2,
+         device        char * htpe,
+         device        char * hids,
++        device  const char * hcnt,
+         threadgroup   char * shmem [[threadgroup(0)]],
++        uint   tgpig[[threadgroup_position_in_grid]],
+         ushort tpitg[[thread_position_in_threadgroup]],
+         ushort   ntg[[threads_per_threadgroup]]) {
+     const short ide = tpitg; // expert id
+ 
+-    uint32_t n_all = 0;
++    device const uint32_t * cnt = (device const uint32_t *) hcnt;
+ 
+-    device int32_t * ids_i32 = (device int32_t *) hids + ide*args.ne21;
++    // rows of this expert in the earlier chunks
++    uint32_t n_all = 0;
++    for (uint c = 0; c < tgpig; ++c) {
++        n_all += cnt[c*args.ne02 + ide];
++    }
+ 
+-    for (int i21 = 0; i21 < args.ne21; i21 += ntg) { // n_tokens
+-        if (i21 + tpitg < args.ne21) {
+-            device const int32_t * src2_i32 = (device const int32_t *) (src2 + (i21 + tpitg)*args.nb21);
++    const int t0 = tgpig*N_MM_ID_MAP_CHUNK;
++    const int nt = min(N_MM_ID_MAP_CHUNK, args.ne21 - t0);
+ 
+-            threadgroup uint16_t * sids = (threadgroup uint16_t *) shmem + tpitg*ne20;
++    threadgroup uint16_t * sids = (threadgroup uint16_t *) shmem;
+ 
+-            #pragma unroll(ne20)
+-            for (short i20 = 0; i20 < ne20; i20++) {
+-                sids[i20] = src2_i32[i20];
+-            }
+-        }
+-
+-        threadgroup_barrier(mem_flags::mem_threadgroup);
+-
+-        for (short t = 0; t < ntg; t++) {
+-            if (i21 + t >= args.ne21) {
+-                break;
+-            }
++    for (int j = tpitg; j < nt*ne20; j += ntg) {
++        sids[j] = ((device const int32_t *) (src2 + (t0 + j/ne20)*args.nb21))[j%ne20];
++    }
+ 
+-            threadgroup const uint16_t * sids = (threadgroup const uint16_t *) shmem + t*ne20;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+-            short sel = 0;
+-            #pragma unroll(ne20)
+-            for (short i20 = 0; i20 < ne20; i20++) {
+-                sel += (sids[i20] == ide)*(i20 + 1);
+-            }
++    device int32_t * ids_i32 = (device int32_t *) hids + ide*args.ne21;
+ 
+-            ids_i32[n_all] = (i21 + t)*ne20 + sel - 1;
++    for (short t = 0; t < nt; t++) {
++        short sel = 0;
++        #pragma unroll(ne20)
++        for (short i20 = 0; i20 < ne20; i20++) {
++            sel += (sids[t*ne20 + i20] == ide)*(i20 + 1);
++        }
+ 
+-            n_all += sel > 0;
++        if (sel > 0) {
++            ids_i32[n_all++] = (t0 + t)*ne20 + sel - 1;
+         }
++    }
+ 
+-        threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (tgpig != 0) {
++        return;
++    }
++
++    for (int c = 1; c < (args.ne21 + N_MM_ID_MAP_CHUNK - 1)/N_MM_ID_MAP_CHUNK; ++c) {
++        n_all += cnt[c*args.ne02 + ide];
+     }
+ 
+     device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
+     tpe_u32[ide] = n_all;
+ 
++    // sids is reused below
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
+     // byteplan: first compact tile of each expert (exclusive prefix sum of its 32-token tiles) and the total,
+     // so kernel_mul_mm_id can start one threadgroup per non-empty tile
+     const uint32_t n_tiles = (n_all + 31)/32;
+@@ -529,6 +570,18 @@ template [[host_name("kernel_mul_mm_id_map0_ne20_10")]] kernel kernel_mul_mm_id_
+ template [[host_name("kernel_mul_mm_id_map0_ne20_16")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<16>;
+ template [[host_name("kernel_mul_mm_id_map0_ne20_22")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<22>;
+ 
++typedef decltype(kernel_mul_mm_id_map0_cnt<1>) kernel_mul_mm_id_map0_cnt_t;
++
++template [[host_name("kernel_mul_mm_id_map0_cnt_ne20_1" )]] kernel kernel_mul_mm_id_map0_cnt_t kernel_mul_mm_id_map0_cnt<1>;
++template [[host_name("kernel_mul_mm_id_map0_cnt_ne20_2" )]] kernel kernel_mul_mm_id_map0_cnt_t kernel_mul_mm_id_map0_cnt<2>;
++template [[host_name("kernel_mul_mm_id_map0_cnt_ne20_4" )]] kernel kernel_mul_mm_id_map0_cnt_t kernel_mul_mm_id_map0_cnt<4>;
++template [[host_name("kernel_mul_mm_id_map0_cnt_ne20_5" )]] kernel kernel_mul_mm_id_map0_cnt_t kernel_mul_mm_id_map0_cnt<5>;
++template [[host_name("kernel_mul_mm_id_map0_cnt_ne20_6" )]] kernel kernel_mul_mm_id_map0_cnt_t kernel_mul_mm_id_map0_cnt<6>;
++template [[host_name("kernel_mul_mm_id_map0_cnt_ne20_8" )]] kernel kernel_mul_mm_id_map0_cnt_t kernel_mul_mm_id_map0_cnt<8>;
++template [[host_name("kernel_mul_mm_id_map0_cnt_ne20_10")]] kernel kernel_mul_mm_id_map0_cnt_t kernel_mul_mm_id_map0_cnt<10>;
++template [[host_name("kernel_mul_mm_id_map0_cnt_ne20_16")]] kernel kernel_mul_mm_id_map0_cnt_t kernel_mul_mm_id_map0_cnt<16>;
++template [[host_name("kernel_mul_mm_id_map0_cnt_ne20_22")]] kernel kernel_mul_mm_id_map0_cnt_t kernel_mul_mm_id_map0_cnt<22>;
++
+ template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+ kernel void kernel_mul_mm_id(
+         constant ggml_metal_kargs_mul_mm_id & args,
+@@ -627,8 +680,8 @@ kernel void kernel_mul_mm_id(
+     const float s1_scale = FC_mul_mm_id_amax ? ((device const float *) amax)[1] : 1.0f;
+ 
+ #ifndef GGML_METAL_HAS_TENSOR
+-    S0_8x8 ma[4];
+-    S1_8x8 mb[2];
++    S0_8x8 ma[8];
++    S1_8x8 mb[1];
+ 
+     simdgroup_float8x8 mc[8];
+ 
+@@ -636,8 +689,9 @@ kernel void kernel_mul_mm_id(
+         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+     }
+ 
+-    // simdgroups 2,3 own rows NR1H..NR1-1
+-    const bool sg_active = has_hi || sgitg < 2;
++    // byteplan: simdgroup g owns token rows 8g..8g+7 of the tile (all 64 weight rows), so a simdgroup without rows
++    // of the expert skips its MMAs; each output element sees the same MMA sequence as before
++    const bool sg_active = nr1 > 8*sgitg;
+ #else
+     auto tA  = tensor<threadgroup S0, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(NK, NR0));
+ 
+@@ -795,26 +849,24 @@ kernel void kernel_mul_mm_id(
+ #ifndef GGML_METAL_HAS_TENSOR
+         if (sg_active) {
+             // load matrices from threadgroup memory and conduct outer products
+-            threadgroup const S0 * lsma = (sa + 4*64*(sgitg%2));
+-            threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/2));
++            threadgroup const S0 * lsma = sa;
++            threadgroup const S1 * lsmb = sb + 64*sgitg;
+ 
+             FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+                 simdgroup_barrier(mem_flags::mem_none);
+ 
+-                FOR_UNROLL (short i = 0; i < 4; i++) {
++                FOR_UNROLL (short i = 0; i < 8; i++) {
+                     simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+                 }
+ 
+                 simdgroup_barrier(mem_flags::mem_none);
+ 
+-                FOR_UNROLL (short i = 0; i < 2; i++) {
+-                    simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+-                }
++                simdgroup_load(mb[0], lsmb, 8, 0, false);
+ 
+                 simdgroup_barrier(mem_flags::mem_none);
+ 
+                 FOR_UNROLL (short i = 0; i < 8; i++){
+-                    simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
++                    simdgroup_multiply_accumulate(mc[i], mb[0], ma[i], mc[i]);
+                 }
+ 
+                 lsma += 8*64;
+@@ -848,10 +900,10 @@ kernel void kernel_mul_mm_id(
+     }
+ #else
+     if (sg_active) {
+-        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
++        threadgroup float * temp_str = ((threadgroup float *) shmem) + 8*sgitg*NR0;
+ 
+         for (short i = 0; i < 8; i++) {
+-            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
++            simdgroup_store(mc[i], temp_str + 8*i, NR0, 0, false);
+         }
+     }
+ #endif
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index c296c86..b675853 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11420,6 +11420,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {12, 2}, 8192, 67, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
++    // byteplan: the QSA prefill budget (2048 + compress ratio - 1), heads of a KV group per threadgroup
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051));
+ 
+     // sparse mask + quantized cache
+     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
+@@ -11860,6 +11862,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+ 
++    // byteplan: qwen4exp QSA prefill attention: 24 query heads on 2 KV heads of 256, a 1024-token batch over the
++    // ~2048 cells that the top-k selection keeps
++    for (int kv : {1024, 2048}) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    }
++    for (int kv : {4096, 8192}) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051));
++    }
++
++    // byteplan: qwen4exp expert prefill, 512 experts top-10 in Q2_0: gate/up (shared token rows) and down
++    for (int bs : {1024, 2048}) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, true,  640,  bs, 2560));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
++    }
++
+     // qwen3-30b-a3b
+     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
+         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {
+-- 
+2.53.0
+

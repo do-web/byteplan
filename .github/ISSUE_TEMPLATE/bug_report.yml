@@ -1,0 +1,25 @@
+name: Bug report
+description: Something does not work
+body:
+  - type: input
+    id: mac
+    attributes:
+      label: Mac
+      description: Chip, memory and macOS version (Apple menu > About This Mac)
+      placeholder: M3 Max, 64 GB, macOS 26.6
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      placeholder: bin/chat --spar 410
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The last lines in the terminal help most.
+    validations:
+      required: true
