@@ -18,7 +18,7 @@ SP="$D/ista-o1-spar/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-dense-q8_0-router-q8_0-spar"
 PROJ="$D/cudecnik/Qwen3.8-Flash-Next-refusal-projection.gguf"
 
 die() { echo "bin/chat: $*" >&2; exit 2; }
-CTX=65536 SPAR="" UNCENSORED=0
+CTX=65536 SPAR="" UNCENSORED=0 PASS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) sed -n '2,10p' "$0" | cut -c3-; exit 0 ;;
@@ -31,7 +31,7 @@ while [ $# -gt 0 ]; do
       SPAR="${2:-}"; shift 2 || true
       [[ "$SPAR" =~ ^[0-9]+$ ]] && [ "$SPAR" -ge 10 ] && [ "$SPAR" -le 512 ] || die "--spar needs 10..512" ;;
     --uncensored) UNCENSORED=1; shift ;;
-    *) break ;;
+    *) PASS+=("$1"); shift ;;  # llama-server options, in any order with ours
   esac
 done
 
@@ -76,4 +76,4 @@ echo "Byteplan: $((CTX / 1024))k context${SPAR:+, expert pool $SPAR/512}$([ "$UN
 echo "          open http://127.0.0.1:8080 (needs ~$NEED_GB GB free memory)" >&2
 exec "$ROOT/bin/run-guarded" --profile parallel --need-gb "$NEED_GB" -- env "${ENV[@]}" "$SERVER" \
   "${MODEL[@]}" -lm mmap -lzm on "${VISION[@]}" "${SPEC[@]}" --chat-template-file "$D/qwen-meta/chat_template.jinja" \
-  -c "$CTX" -np 1 --cache-ram 0 --ctx-checkpoints 8 --checkpoint-min-step 1024 --host 127.0.0.1 --port 8080 "$@"
+  -c "$CTX" -np 1 --cache-ram 0 --ctx-checkpoints 8 --checkpoint-min-step 1024 --host 127.0.0.1 --port 8080 ${PASS[@]+"${PASS[@]}"}
